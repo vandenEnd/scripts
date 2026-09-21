@@ -1017,78 +1017,40 @@ for col_letter in ("B", "C", "D", "F", "G", "H"):
 # entirely and guarantees this regression uses the exact same numbers
 # the "_full" sheets display.
 #
-# HONESTY NOTE: this is a two-way fixed-effects (country + year) OLS
-# regression via the standard dummy-variable (LSDV) approach, with
-# PLAIN (homoskedastic) OLS standard errors -- NOT the Driscoll-Kraay
-# robust standard errors this project's underlying panel-LP modeling
-# scripts use elsewhere. No external regression package (statsmodels/
-# linearmodels) was available to install in this environment (no
-# network access), so this is a from-scratch numpy implementation,
-# validated separately against synthetic data with a known true
-# coefficient (recovered to within 0.001 of the true value) before
-# being applied here.
+# All OLS, logit, and probit regressions below use country-clustered
+# sandwich standard errors with the same finite-sample correction,
+# equivalent to Stata's vce(cluster country_id).
 from scipy import stats as _stats
 
 
-def _driscoll_kraay_cov(X_mat, resid, time_labels, bandwidth=None):
+def _country_clustered_cov(bread, score_obs, cluster_labels, estimator_name):
     """
-    Driscoll-Kraay (1998) HAC standard errors for a fixed-effects panel
-    OLS model -- robust to (1) heteroskedasticity, (2) serial
-    correlation WITHIN each entity over time, and (3) cross-sectional
-    correlation BETWEEN entities at the same point in time. Chosen here
-    specifically because the explanatory variables in this project
-    (hs_export_share, ai_inv_share, etc.) are plausibly non-stationary/
-    trending panel series -- with country and time fixed effects
-    already absorbing the COMMON trend and each entity's own average
-    level, what remains as a real risk is residual serial correlation
-    WITHIN a country's own deviations from that trend, which understates
-    plain (homoskedastic) standard errors and overstates significance.
-    Driscoll-Kraay is the standard fix for exactly that risk in a panel
-    with a moderate number of time periods (this project's ~15-20
-    years fits the setting Driscoll & Kraay's own asymptotics target).
-
-    Mechanics: for each time period t, aggregate the per-observation
-    "score" contributions x_i*u_i ACROSS ALL ENTITIES observed in that
-    period into one vector h_t -- this cross-sectional summation is
-    what makes the estimator robust to correlation BETWEEN entities
-    (e.g. all 10 countries' explanatory variables/residuals moving
-    together in a shock year), not just within one entity's own time
-    series. A Newey-West-style Bartlett-kernel-weighted covariance of
-    these h_t vectors is then computed (this is the part that captures
-    serial correlation up to `bandwidth` lags), and finally sandwiched
-    between (X'X)^-1 on both sides to get the coefficient covariance
-    matrix.
-
-    bandwidth: max lag length for the Bartlett kernel. Defaults to the
-    standard Newey-West (1994) automatic rule, floor(4*(T/100)^(2/9)),
-    rounded up to at least 1.
+    Country-clustered sandwich covariance used by OLS, logit, and probit.
+    `bread` is the inverse information matrix appropriate to the estimator;
+    `score_obs` contains one score vector per observation. Scores are summed
+    within country before forming the sandwich meat. The finite-sample factor
+    matches the standard Stata-style clustered covariance correction.
     """
-    n, k = X_mat.shape
-    unique_times = sorted(pd.unique(time_labels))
-    T = len(unique_times)
-    if bandwidth is None:
-        bandwidth = max(1, int(np.floor(4 * (T / 100) ** (2 / 9))))
-
-    # h_t: K-dimensional vector, one per time period, summing x_i*u_i
-    # across every entity observed in that period.
-    h_by_t = []
-    for t in unique_times:
-        mask = (time_labels == t)
-        x_t = X_mat[mask]
-        u_t = resid[mask]
-        h_t = (x_t * u_t[:, None]).sum(axis=0)
-        h_by_t.append(h_t)
-    h_by_t = np.array(h_by_t)  # shape (T, K)
-
-    S_hat = h_by_t.T @ h_by_t  # lag-0 term
-    for lag in range(1, bandwidth + 1):
-        weight = 1.0 - lag / (bandwidth + 1)  # Bartlett kernel
-        cross = h_by_t[lag:].T @ h_by_t[:-lag]
-        S_hat += weight * (cross + cross.T)
-
-    XtX_inv = np.linalg.pinv(X_mat.T @ X_mat)
-    cov = XtX_inv @ S_hat @ XtX_inv
-    return cov, bandwidth
+    cluster_labels = np.asarray(cluster_labels)
+    clusters = pd.unique(cluster_labels)
+    n, k = score_obs.shape
+    n_clusters = len(clusters)
+    if n_clusters < 2:
+        raise ValueError(
+            f"Country-clustered {estimator_name} SEs require at least two countries."
+        )
+    if n <= k:
+        raise ValueError(
+            f"Country-clustered {estimator_name} SEs require N greater than model rank."
+        )
+    cluster_scores = np.vstack([
+        score_obs[cluster_labels == cluster].sum(axis=0)
+        for cluster in clusters
+    ])
+    meat = cluster_scores.T @ cluster_scores
+    correction = (n_clusters / (n_clusters - 1)) * ((n - 1) / (n - k))
+    cov = correction * (bread @ meat @ bread)
+    return cov, n_clusters
 
 
 def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="target_year",
@@ -1101,9 +1063,8 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
     keyed by column name), in the same shape as the main beta/se/
     t_stat/p_value.
 
-    Standard errors are DRISCOLL-KRAAY (see _driscoll_kraay_cov()
-    above for the full rationale and mechanics) -- NOT the plain/
-    homoskedastic formula an earlier version of this function used.
+    Standard errors are country-clustered by entity_col, using the same
+    sandwich estimator and finite-sample correction as logit and probit.
     """
     extra_cols = extra_cols or []
     needed_cols = [y_col, x_col, entity_col, time_col] + extra_cols
@@ -1126,16 +1087,20 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
     y_hat = X_mat @ beta_hat
     resid = y - y_hat
     n, k = X_mat.shape
-    dof = n - k
 
-    dk_cov, dk_bandwidth = _driscoll_kraay_cov(X_mat, resid, d[time_col].values)
-    se_all = np.sqrt(np.abs(np.diag(dk_cov)))
+    bread = np.linalg.pinv(X_mat.T @ X_mat)
+    score_obs = X_mat * resid[:, None]
+    cov, n_clusters = _country_clustered_cov(
+        bread, score_obs, d[entity_col].to_numpy(), "OLS"
+    )
+    se_all = np.sqrt(np.abs(np.diag(cov)))
+    cluster_dof = n_clusters - 1
 
     def _coef_stats(col_name):
         idx = list(X.columns).index(col_name)
         b, s = beta_hat[idx], se_all[idx]
         t = b / s
-        p = 2 * (1 - _stats.t.cdf(abs(t), dof))
+        p = 2 * (1 - _stats.t.cdf(abs(t), cluster_dof))
         return {"beta": b, "se": s, "t_stat": t, "p_value": p}
 
     main = _coef_stats(x_col)
@@ -1151,7 +1116,7 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
         **main, "extra": extra,
         "const": const_hat, "r_squared": r_squared, "n_obs": n_obs,
         "n_entities": len(entities), "n_periods": len(periods),
-        "dk_bandwidth": dk_bandwidth,
+        "n_clusters": n_clusters,
     }
 
 
@@ -1165,6 +1130,9 @@ def panel_logit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="tar
     (1 if > 0, else 0) -- the function itself does the split, so the
     caller passes the SAME continuous growth_surprise column used for
     the OLS tables above.
+
+    Standard errors are country-clustered by entity_col, using the same
+    sandwich estimator and finite-sample correction as OLS and probit.
 
     HONESTY NOTE on why logit (not probit) and what this specification
     does and does NOT solve, stated plainly because the choice was
@@ -1261,17 +1229,17 @@ def panel_logit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="tar
               f"maximum-likelihood solution.")
     beta_hat = opt_result.x
 
-    # Standard errors from the analytic Hessian of the logit log-
-    # likelihood at the optimum (the standard MLE asymptotic-variance
-    # formula: inverse of X'WX, W=diag(p*(1-p))) -- NOT the optimizer's
-    # own (BFGS-approximated) inverse-Hessian estimate, for the same
-    # "compute it directly, don't trust an approximation" principle
-    # already applied to the OLS standard errors above.
+    # Country-clustered sandwich covariance. The bread is the inverse
+    # observed information and the observation scores are x_i*(y_i-p_i).
     z_fitted = X_mat @ beta_hat
     p_fitted = 1.0 / (1.0 + np.exp(-z_fitted))
     w = p_fitted * (1.0 - p_fitted)
     hessian = X_mat.T @ (X_mat * w[:, None])
-    cov = np.linalg.pinv(hessian)
+    bread = np.linalg.pinv(hessian)
+    score_obs = X_mat * (y_arr - p_fitted)[:, None]
+    cov, n_clusters = _country_clustered_cov(
+        bread, score_obs, d[entity_col].to_numpy(), "logit"
+    )
     se_all = np.sqrt(np.abs(np.diag(cov)))
 
     def _coef_stats(col_name):
@@ -1296,6 +1264,7 @@ def panel_logit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="tar
         **main, "extra": extra,
         "pseudo_r2": pseudo_r2, "n_obs": n_obs,
         "n_entities": len(entities), "n_periods": len(periods),
+        "n_clusters": n_clusters,
     }
 
 
@@ -1313,6 +1282,13 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
     "does the functional-form choice (logistic vs. normal link) change
     the substantive conclusions", not a check that resolves the
     incidental-parameters issue either way.
+
+    Standard errors use a country-clustered sandwich covariance matrix,
+    matching Stata's ``vce(cluster country_id)``: the score contributions
+    are summed within country before forming the meat of the sandwich, and
+    the usual finite-sample cluster correction is applied. Thus inference
+    is robust to arbitrary heteroskedasticity and within-country dependence;
+    countries (clusters) are assumed independent of one another.
     """
     extra_cols = extra_cols or []
     needed_cols = [y_col, x_col, entity_col, time_col] + extra_cols
@@ -1370,17 +1346,30 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
               f"maximum-likelihood solution.")
     beta_hat = opt_result.x
 
-    # Standard errors from the analytic Fisher-information Hessian of
-    # the probit log-likelihood at the optimum: X'WX with
-    # w_i = phi(z_i)^2 / (Phi(z_i)*(1-Phi(z_i))) -- the standard probit
-    # asymptotic-variance formula (information-matrix equality holds
-    # at the MLE), NOT the optimizer's own approximate inverse-Hessian.
+    # Country-clustered sandwich covariance, corresponding to Stata's
+    # vce(cluster country_id). The bread is the inverse observed
+    # information for the probit likelihood. The meat is formed from
+    # country-level sums of the individual score vectors, allowing every
+    # observation within a country to be arbitrarily correlated.
     z_fitted = X_mat @ beta_hat
     Phi_fitted = np.clip(_stats.norm.cdf(z_fitted), eps, 1 - eps)
     phi_fitted = _stats.norm.pdf(z_fitted)
-    w = (phi_fitted ** 2) / (Phi_fitted * (1 - Phi_fitted))
-    hessian = X_mat.T @ (X_mat * w[:, None])
-    cov = np.linalg.pinv(hessian)
+    inverse_mills_pos = phi_fitted / Phi_fitted
+    inverse_mills_neg = phi_fitted / (1 - Phi_fitted)
+    observed_info_weight = (
+        y_arr * inverse_mills_pos * (inverse_mills_pos + z_fitted)
+        + (1 - y_arr) * inverse_mills_neg * (inverse_mills_neg - z_fitted)
+    )
+    observed_info = X_mat.T @ (X_mat * observed_info_weight[:, None])
+    bread = np.linalg.pinv(observed_info)
+
+    score_scalar = phi_fitted * (
+        y_arr / Phi_fitted - (1 - y_arr) / (1 - Phi_fitted)
+    )
+    score_obs = X_mat * score_scalar[:, None]
+    cov, n_clusters = _country_clustered_cov(
+        bread, score_obs, d[entity_col].to_numpy(), "probit"
+    )
     se_all = np.sqrt(np.abs(np.diag(cov)))
 
     def _coef_stats(col_name):
@@ -1402,6 +1391,7 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
         **main, "extra": extra,
         "pseudo_r2": pseudo_r2, "n_obs": n_obs,
         "n_entities": len(entities), "n_periods": len(periods),
+        "n_clusters": n_clusters,
     }
 
 
@@ -1889,8 +1879,8 @@ ws_summary.cell(row=reg_start_row, column=1,
                        "time FE + beta*X").font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg_start_row + 1, column=1,
-    value="(two-way fixed effects, OLS via dummy variables; DRISCOLL-KRAAY robust "
-          "standard errors -- see the note below Table 1 for why)"
+    value="(two-way fixed effects, OLS via dummy variables; standard errors "
+          "clustered by country)"
 ).font = Font(italic=True, size=9)
 
 reg_header_row = reg_start_row + 3
@@ -2357,24 +2347,13 @@ note_lines = [
     "     for the beta-vs-gamma interpretation and the incidental-parameters caveat.",
     "(2) PROBIT, X + shock-year interaction: probit counterpart of (5).",
     "(3) PROBIT, above-median value + interaction: probit counterpart of (6).",
-    # Explains the Driscoll-Kraay standard errors used in models (4),
-    # (5), and (6) (the OLS specifications, now in the LATTER three
-    # columns since Probit/OLS swapped column order) -- split across
-    # two lines, same reasoning as (1)/(6) above.
-    "Standard errors for models (4)-(6) (OLS) are DRISCOLL-KRAAY robust, NOT plain/"
-    "homoskedastic -- chosen because several explanatory variables here (e.g. "
-    "hs_export_share, ai_inv_share) are plausibly non-stationary/trending panel series;",
-    "     with country and time FE already absorbing each country's average level and "
-    "the common trend, what remained a real risk was SERIAL CORRELATION in the "
-    "residuals within a country's own deviations from that trend -- Driscoll-Kraay",
-    "     addresses this directly by using a Newey-West-style HAC (heteroskedasticity- "
-    "and autocorrelation-consistent) covariance estimator, additionally robust to "
-    "cross-sectional correlation between countries in the same year; without this,",
-    "     serial correlation would understate the plain OLS standard errors and "
-    "overstate significance (confirmed on synthetic data with known serial "
-    "correlation: the Driscoll-Kraay SE came out larger than the plain OLS SE, as",
-    "     expected). Models (1)-(3) (probit) still use the analytic-Hessian standard "
-    "errors described in panel_probit_two_way_fe()'s own docstring, not Driscoll-Kraay.",
+    "Standard errors in every OLS, probit, and logit regression are COUNTRY-CLUSTERED "
+    "sandwich standard errors, equivalent to Stata's vce(cluster country_id).",
+    "     This allows arbitrary heteroskedasticity and dependence among observations "
+    "within the same country; inference assumes independence across countries. The "
+    "same finite-sample cluster correction is used for all three estimators.",
+    "     OLS p-values use a t distribution with number-of-countries minus one degrees "
+    "of freedom; probit and logit report their conventional cluster-robust z tests.",
     # Explanatory note on standardization, per explicit instruction --
     # split across several lines, same wrapping reasoning as the notes
     # above.
