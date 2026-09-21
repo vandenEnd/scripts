@@ -53,38 +53,36 @@ cell range" or show a visibly wrong row count if so).
 USAGE: edit the `cd` and `global xlsxfile` lines below, then run this
 whole do-file. It writes four .dta files in the same folder.
 ==============================================================================*/
+adopath + "C:\Program Files\StataADO\ftoolspackage"
+adopath + "C:\Program Files\StataADO\reghdfepackage"
 
 clear all
 set more off
+cd "G:\EBO\MB\vdEnd\DSW_G\risk mngt"
+*local data_file "ict_growth_surprise_scatter.xlsx"
 
-* ---- EDIT THESE TWO LINES to match your own setup ------------------------
-cd "."
-global xlsxfile "ict_growth_surprise_scatter.xlsx"
 * ----------------------------------------------------------------------------
-
-capture confirm file "$xlsxfile"
-if _rc {
-    display as error "File not found: $xlsxfile -- edit the cd/xlsxfile lines above."
-    exit 601
-}
-
+import excel "ict_growth_surprise_scatter_hs.xlsx", ///
+sheet("data_regr") ///
+cellrange(A2134:F2682) ///
+firstrow clear
 /*==============================================================================
   ICT investment share -- blocks at rows 1 (plain), 2133 (interaction),
   4265 (above-median).
 ==============================================================================*/
-import excel "$xlsxfile", sheet("data_regr") cellrange(A2134:F2682) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A2134:F2682) firstrow clear
 rename interaction ict_x_shock
 tempfile ict_interact
 save "`ict_interact'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A4266:G4814) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A4266:G4814) firstrow clear
 rename above_median ict_above_median
 rename above_x_shock ict_above_x_shock
 keep ict_above_median ict_above_x_shock
 tempfile ict_abovemed
 save "`ict_abovemed'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A2:D550) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A2:D550) firstrow clear
 * Positional append (NOT a key-based merge) -- see the note at the top
 * of this file for why: confirmed country/target_year/growth_surprise
 * match row-for-row across all three ICT blocks, in the same order.
@@ -104,19 +102,19 @@ display as result "panel_ict.dta written: " _N " rows."
 /*==============================================================================
   AI/ICT-related HS export share -- blocks at rows 552, 2684, 4816.
 ==============================================================================*/
-import excel "$xlsxfile", sheet("data_regr") cellrange(A2685:F3265) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A2685:F3265) firstrow clear
 rename interaction hs_export_x_shock
 tempfile hs_interact
 save "`hs_interact'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A4817:G5397) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A4817:G5397) firstrow clear
 rename above_median hs_export_above_median
 rename above_x_shock hs_export_above_x_shock
 keep hs_export_above_median hs_export_above_x_shock
 tempfile hs_abovemed
 save "`hs_abovemed'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A553:D1133) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A553:D1133) firstrow clear
 merge 1:1 _n using "`hs_interact'", nogenerate update replace
 merge 1:1 _n using "`hs_abovemed'", nogenerate
 order country target_year growth_surprise hs_export_share shock_year_dummy ///
@@ -134,19 +132,19 @@ display as result "panel_hs_export.dta written: " _N " rows."
   National vs. semiconductor index correlation -- blocks at rows 1135,
   3267, 5399.
 ==============================================================================*/
-import excel "$xlsxfile", sheet("data_regr") cellrange(A3268:F3820) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A3268:F3820) firstrow clear
 rename interaction stock_corr_x_shock
 tempfile sc_interact
 save "`sc_interact'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A5400:G5952) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A5400:G5952) firstrow clear
 rename above_median stock_corr_above_median
 rename above_x_shock stock_corr_above_x_shock
 keep stock_corr_above_median stock_corr_above_x_shock
 tempfile sc_abovemed
 save "`sc_abovemed'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A1136:D1688) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A1136:D1688) firstrow clear
 merge 1:1 _n using "`sc_interact'", nogenerate update replace
 merge 1:1 _n using "`sc_abovemed'", nogenerate
 order country target_year growth_surprise stock_semis_corr_annual shock_year_dummy ///
@@ -163,19 +161,19 @@ display as result "panel_stock_corr.dta written: " _N " rows."
 /*==============================================================================
   AI incoming investment share -- blocks at rows 1690, 3822, 5954.
 ==============================================================================*/
-import excel "$xlsxfile", sheet("data_regr") cellrange(A3823:F4263) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A3823:F4263) firstrow clear
 rename interaction ai_inv_x_shock
 tempfile ai_interact
 save "`ai_interact'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A5955:G6395) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A5955:G6395) firstrow clear
 rename above_median ai_inv_above_median
 rename above_x_shock ai_inv_above_x_shock
 keep ai_inv_above_median ai_inv_above_x_shock
 tempfile ai_abovemed
 save "`ai_abovemed'"
 
-import excel "$xlsxfile", sheet("data_regr") cellrange(A1691:D2131) firstrow clear
+import excel "ict_growth_surprise_scatter.xlsx", sheet("data_regr") cellrange(A1691:D2131) firstrow clear
 merge 1:1 _n using "`ai_interact'", nogenerate update replace
 merge 1:1 _n using "`ai_abovemed'", nogenerate
 order country target_year growth_surprise ai_inv_share shock_year_dummy ///
@@ -201,3 +199,29 @@ display as text `"  reghdfe growth_surprise ict_share ict_x_shock, absorb(countr
 display as text `"  reghdfe growth_surprise ict_above_median ict_above_x_shock, absorb(country target_year) vce(cluster country)"'
 display as text `"  * -- or, without reghdfe: --"'
 display as text `"  regress growth_surprise ict_share i.country i.target_year, vce(cluster country)"'
+
+* voorbeeld voor middelste OLS regressie
+reghdfe growth_surprise ai_inv_share ai_inv_x_shock, absorb(country target_year) vce(cluster country)
+*reghdfe growth_surprise hs_export_share hs_export_x_shock, absorb(country target_year) vce(cluster country)
+
+**** check for the Python script (PM: Stata has no standardized variable, Stata does not use 2024 data for 2025 if last year is missing)
+
+* probit regressie
+encode country, gen(country_id)
+gen positive_surprise = growth_surprise > 0
+
+* probit model 1
+probit positive_surprise ict_share i.country_id i.target_year, vce(cluster country_id)
+probit positive_surprise ict_share ict_x_shock i.country_id i.target_year, vce(cluster country_id)
+
+* probit model 2
+probit positive_surprise hs_export_share i.country_id i.target_year, vce(cluster country_id)
+probit positive_surprise hs_export_share hs_export_x_shock i.country_id i.target_year, vce(cluster country_id)
+
+* probit model 3
+egen corr_z = std(stock_semis_corr_annual)
+probit positive_surprise corr_z i.country_id i.target_year
+*, vce(cluster country_id)
+probit positive_surprise stock_semis_corr_annual stock_corr_x_shock i.country_id i.target_year, vce(cluster country_id)
+
+*probit positive_surprise ai_inv_share ai_inv_x_shock i.country_id i.target_year, vce(cluster country_id)
