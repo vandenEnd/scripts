@@ -19,77 +19,26 @@ ict = ict.rename(columns={"year": "target_year"})
 eur_export = pd.read_excel("ai_data.xlsx", sheet_name="eur_export")[["country", "year", "share"]]
 eur_export = eur_export.rename(columns={"year": "target_year", "share": "eur_export_share"})
 
-# Records which (value_col, country, target_year) values were filled in
-# from an earlier year by carry_forward_missing_year() below, so the
-# "explanatory_year_used" column in the special-years sheets can still
-# report the TRUE source year instead of presenting a carried-forward
-# value as a genuine same-year observation.
-CARRIED_FORWARD_KEYS = {}
-
-
-def carry_forward_missing_year(df, value_col, target_year, source_year, label):
-    """
-    Fill a missing (country, target_year) observation with that SAME
-    country's own source_year value -- applied PER COUNTRY, not
-    all-or-nothing.
-
-    Per-country matters here: an earlier version of this logic only
-    substituted when target_year was absent for EVERY country, which
-    silently did nothing in the common real case where SOME countries
-    have already reported the year and others haven't. ict_share is
-    exactly that case in the current workbook (2025 present for 3 of the
-    10 countries, missing for the other 7), so an all-or-nothing check
-    would have left those 7 countries without a 2025 row and quietly
-    dropped them from every 2025 regression and bivariate test.
-
-    Only countries that (a) lack a non-null value for target_year and
-    (b) have a non-null value for source_year are filled; a country
-    with a genuine target_year value keeps it untouched. This is a
-    deliberate, visible substitution -- reported in the diagnostic
-    below, and recorded in CARRIED_FORWARD_KEYS so that downstream
-    sheets can still show WHICH year each value really came from
-    rather than presenting a substituted value as a genuine one.
-    """
-    have_target = set(
-        df.loc[df["target_year"].eq(target_year) & df[value_col].notna(), "country"])
-    source_rows = df.loc[
-        df["target_year"].eq(source_year) & df[value_col].notna()].copy()
-    to_fill = source_rows[~source_rows["country"].isin(have_target)]
-    if to_fill.empty:
-        print(f"  [diagnostic] {label}: no {target_year} substitution needed "
-              f"({len(have_target)} countries already have a {target_year} value).")
-        return df
-    substitute = to_fill.copy()
-    substitute["target_year"] = target_year
-    for country in substitute["country"]:
-        CARRIED_FORWARD_KEYS[(value_col, country, target_year)] = source_year
-    # Drop any pre-existing all-null target_year rows for these countries,
-    # so the substitute doesn't sit alongside an empty duplicate row.
-    df = df[~(df["target_year"].eq(target_year)
-              & df["country"].isin(substitute["country"])
-              & df[value_col].isna())]
-    out = pd.concat([df, substitute], ignore_index=True)
-    print(f"  [diagnostic] {label}: filled {len(substitute)} country/countries' "
-          f"{target_year} {value_col} with their own {source_year} value "
-          f"({sorted(substitute['country'])}); {len(have_target)} country/countries "
-          f"already had a genuine {target_year} value.")
-    return out
-
-
-# eur_export: check/fill 2025 the same way (the current workbook already
-# has 2025 for all 10 countries, so this is normally a no-op -- but it
-# stays here so a future refresh with an incomplete 2025 is handled).
-eur_export = carry_forward_missing_year(
-    eur_export, "eur_export_share", 2025, 2024, "eur_export")
-
-# ict_share: per explicit instruction, apply the SAME 2025 carry-forward
-# procedure that the export variable gets, so that 2025 is included for
-# this variable too in the regressions and the unconditional bivariate
-# tests instead of those countries silently dropping out of 2025.
-ict = carry_forward_missing_year(ict, "ict_share", 2025, 2024, "ict_inv")
-
 ai_inv = pd.read_excel("ai_data.xlsx", sheet_name="ai_inv")[["country", "year", "share"]]
 ai_inv = ai_inv.rename(columns={"year": "target_year", "share": "ai_inv_share"})
+
+# Contemporaneous State Aid control. Unlike the four focal explanatory
+# variables, support_share uses the SAME year t as growth_surprise. If a
+# country's 2025 value is unavailable, use that country's 2024 value; an
+# observed 2025 value always takes precedence.
+support = pd.read_excel("ai_data.xlsx", sheet_name="support")[[
+    "country", "year", "support_share"
+]].rename(columns={"year": "target_year"})
+support["support_source_year"] = support["target_year"]
+support_2025_fallback = support.loc[
+    support["target_year"].eq(2024)
+    & ~support["country"].isin(
+        support.loc[support["target_year"].eq(2025), "country"])
+].copy()
+support_2025_fallback["target_year"] = 2025
+support_control = pd.concat([support, support_2025_fallback], ignore_index=True)
+support_control = support_control.drop_duplicates(
+    ["country", "target_year"], keep="first")
 
 # National-vs-semiconductor index correlation: rolling 8-QUARTER
 # correlation between each country's national index log-return and the
@@ -114,14 +63,44 @@ stock_corr_annual = (idx_merged.dropna(subset=["roll_corr_8q"])
                       .mean().reset_index()
                       .rename(columns={"roll_corr_8q": "stock_semis_corr_annual"}))
 
-merged_ict = forecast.merge(ict, on=["country", "target_year"], how="inner")
-merged_eur = forecast.merge(eur_export, on=["country", "target_year"], how="inner")
-merged_corr = forecast.merge(stock_corr_annual, on=["country", "target_year"], how="inner")
-merged_ai_inv = forecast.merge(ai_inv, on=["country", "target_year"], how="inner")
-print(f"ict_share merge: {len(merged_ict)} rows (from {len(forecast)} forecast rows)")
-print(f"eur_export share merge: {len(merged_eur)} rows (from {len(forecast)} forecast rows)")
-print(f"stock/semis correlation merge: {len(merged_corr)} rows (from {len(forecast)} forecast rows)")
-print(f"ai_inv share merge: {len(merged_ai_inv)} rows (from {len(forecast)} forecast rows)")
+def align_previous_year_explanatory(df):
+    """Re-index explanatory year s to outcome year t=s+1."""
+    lagged = df.copy()
+    lagged["explanatory_source_year"] = lagged["target_year"]
+    lagged["target_year"] = lagged["target_year"] + 1
+    return lagged
+
+
+ict_lagged = align_previous_year_explanatory(ict)
+eur_export_lagged = align_previous_year_explanatory(eur_export)
+stock_corr_annual_lagged = align_previous_year_explanatory(stock_corr_annual)
+ai_inv_lagged = align_previous_year_explanatory(ai_inv)
+
+merged_ict = forecast.merge(ict_lagged, on=["country", "target_year"], how="inner")
+merged_eur = forecast.merge(eur_export_lagged, on=["country", "target_year"], how="inner")
+merged_corr = forecast.merge(
+    stock_corr_annual_lagged, on=["country", "target_year"], how="inner")
+merged_ai_inv = forecast.merge(ai_inv_lagged, on=["country", "target_year"], how="inner")
+
+
+def add_support_control(df):
+    """Attach same-year support_share (2024 fallback only for missing 2025)."""
+    return df.merge(
+        support_control,
+        on=["country", "target_year"],
+        how="left",
+        validate="many_to_one",
+    )
+
+
+merged_ict = add_support_control(merged_ict)
+merged_eur = add_support_control(merged_eur)
+merged_corr = add_support_control(merged_corr)
+merged_ai_inv = add_support_control(merged_ai_inv)
+print(f"previous-year ict_share merge: {len(merged_ict)} rows (from {len(forecast)} forecast rows)")
+print(f"previous-year eur_export share merge: {len(merged_eur)} rows (from {len(forecast)} forecast rows)")
+print(f"previous-year stock/semis correlation merge: {len(merged_corr)} rows (from {len(forecast)} forecast rows)")
+print(f"previous-year ai_inv share merge: {len(merged_ai_inv)} rows (from {len(forecast)} forecast rows)")
 
 wb = openpyxl.Workbook()
 wb.remove(wb.active)  # remove the default empty sheet; we add our own below
@@ -134,12 +113,14 @@ def write_data_sheet(wb, sheet_name, df, explanatory_col, explanatory_header):
     Writes one data sheet: country, vintage, vintage_round, target_year,
     forecast_growth_annual_pct, realized_growth_annual_pct,
     growth_surprise_pct (LIVE FORMULA = realized - forecast),
-    <explanatory_header>. Returns (worksheet, last_data_row).
+    <explanatory_header>, explanatory_source_year. Returns
+    (worksheet, last_data_row).
     """
     ws = wb.create_sheet(sheet_name)
     headers = ["country", "vintage", "vintage_round", "target_year",
                "forecast_growth_annual_pct", "realized_growth_annual_pct",
-               "growth_surprise_pct", explanatory_header]
+               "growth_surprise_pct", explanatory_header,
+               "explanatory_source_year"]
     for col_idx, h in enumerate(headers, start=1):
         c = ws.cell(row=1, column=col_idx, value=h)
         c.font = bold
@@ -155,8 +136,10 @@ def write_data_sheet(wb, sheet_name, df, explanatory_col, explanatory_header):
         ws.cell(row=row_idx, column=7,
                 value=f'=IF(OR(F{row_idx}="",E{row_idx}=""),"",F{row_idx}-E{row_idx})')
         ws.cell(row=row_idx, column=8, value=getattr(row, explanatory_col))
+        ws.cell(row=row_idx, column=9,
+                value=int(row.explanatory_source_year))
 
-    for col_idx in range(1, 9):
+    for col_idx in range(1, 10):
         ws.column_dimensions[chr(64 + col_idx)].width = 18
 
     last_row = len(df_sorted) + 1
@@ -287,16 +270,16 @@ title_cell.font = Font(bold=True, size=14)
 
 # --- Six (data, chart) sheet pairs: 3 explanatory variables x 3 periods ---
 specs = [
-    ("ict_share", merged_ict, "ict_share", "ICT investment share", "1F77B4",
-     "vs. ICT investment share"),
-    ("eur_export", merged_eur, "eur_export_share", "AI/ICT-related EU export share", "D62728",
-     "vs. AI/ICT-related EU export share"),
+    ("ict_share", merged_ict, "ict_share", "Previous-year ICT investment share", "1F77B4",
+     "vs. Previous-year ICT investment share"),
+    ("eur_export", merged_eur, "eur_export_share", "Previous-year AI/ICT-related EU export share", "D62728",
+     "vs. Previous-year AI/ICT-related EU export share"),
     ("stock_corr", merged_corr, "stock_semis_corr_annual",
-     "National vs. semiconductor index correlation (8Q rolling, annualized)", "2CA02C",
+     "Previous-year national vs. semiconductor index correlation (8Q rolling, annualized)", "2CA02C",
      "vs. national-semiconductor index correlation"),
     ("ai_inv_share", merged_ai_inv, "ai_inv_share",
-     "AI incoming investment share (per avg. quarterly GDP)", "E377C2",
-     "vs. AI incoming investment share"),
+     "Previous-year AI incoming investment share (per avg. quarterly GDP)", "E377C2",
+     "vs. Previous-year AI incoming investment share"),
 ]
 periods = [
     ("full", None, None, "full sample"),
@@ -544,7 +527,8 @@ def write_clustered_time_chart(wb, cluster_key, merged_df, cluster_col, cluster_
     ws = wb.create_sheet(data_sheet_name)
     headers = ["country", "vintage", "vintage_round", "target_year",
                "forecast_growth_annual_pct", "realized_growth_annual_pct",
-               "growth_surprise_pct", cluster_header, "cluster"]
+               "growth_surprise_pct", cluster_header, "cluster",
+               "explanatory_source_year"]
     for col_idx, h in enumerate(headers, start=1):
         c = ws.cell(row=1, column=col_idx, value=h)
         c.font = bold
@@ -560,8 +544,10 @@ def write_clustered_time_chart(wb, cluster_key, merged_df, cluster_col, cluster_
                 value=f'=IF(OR(F{row_idx}="",E{row_idx}=""),"",F{row_idx}-E{row_idx})')
         ws.cell(row=row_idx, column=8, value=getattr(row, cluster_col))
         ws.cell(row=row_idx, column=9, value=row.cluster)
+        ws.cell(row=row_idx, column=10,
+                value=int(row.explanatory_source_year))
 
-    for col_idx in range(1, 10):
+    for col_idx in range(1, 11):
         ws.column_dimensions[chr(64 + col_idx)].width = 18
 
     n_below = int((df_sorted["cluster"] == "Below median").sum())
@@ -651,31 +637,12 @@ SPECIAL_YEARS_ROUNDS = ["Spring", "Autumn"]
 
 
 def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, header, color,
-                               ws_summary, summary_next_row, substitute_year_map=None,
-                               col_offset=0):
+                               ws_summary, summary_next_row, col_offset=0):
     """
-    substitute_year_map: e.g. {2025: 2024} -- for a target_year with no
-    genuine explanatory-variable data of its own, use that OTHER year's
-    value instead, FOR CLASSIFICATION PURPOSES ONLY.
-
-    NOTE: this is now normally left as None. The 2025 gap in ict_share
-    and eur_export_share is filled UPSTREAM, per country, by
-    carry_forward_missing_year(), so the explanatory DataFrames reaching
-    this function already contain a 2025 row for every country --
-    genuine where the source published one, carried forward from 2024
-    where it didn't. Passing substitute_year_map={2025: 2024} here as
-    well would now be actively WRONG: it would force a 2024 lookup even
-    for countries whose 2025 value is genuine (all 10 for
-    eur_export_share, and FI/FR/IT for ict_share in the current
-    workbook), silently discarding real data.
-
-    Transparency is preserved either way: the "explanatory_year_used"
-    column shows exactly which year's value each row actually came from,
-    reading carried-forward rows out of CARRIED_FORWARD_KEYS, so a
-    substituted row is never silently indistinguishable from a genuine
-    same-year one.
+    For every shock-year outcome t, use the explanatory observation from
+    exactly t-1. There is no same-year lookup and no fallback: if country i
+    has no value in t-1, that outcome observation is excluded.
     """
-    substitute_year_map = substitute_year_map or {}
 
     # horizon==0 is essential here, not just vintage_round=="Spring":
     # without it, an EARLIER round's horizon=1 forecast (e.g.
@@ -691,29 +658,23 @@ def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, h
                        & (raw_forecast["horizon"] == 0)
                        & (raw_forecast["target_year"].isin(SPECIAL_YEARS))].copy()
 
-    # Build a (country, target_year) -> explanatory value lookup. The
-    # 2025 gap is filled upstream by carry_forward_missing_year(), so a
-    # plain lookup now finds a row for every country/year; the
-    # substitute_year_map path below remains only as an escape hatch for
-    # a future variable that needs classification-time substitution.
-    lookup_years_needed = set(SPECIAL_YEARS) | set(substitute_year_map.values())
+    # Build a (country, source_year) -> explanatory value lookup for t-1.
+    lookup_years_needed = {year - 1 for year in SPECIAL_YEARS}
     explanatory_lookup = raw_explanatory[
         raw_explanatory["target_year"].isin(lookup_years_needed)
+        & raw_explanatory[col].notna()
     ].set_index(["country", "target_year"])[col]
 
     explanatory_values, explanatory_years_used = [], []
     keep_mask = []
     for _, row in df.iterrows():
         ty = row["target_year"]
-        lookup_year = substitute_year_map.get(ty, ty)
-        key = (row["country"], lookup_year)
-        if key in explanatory_lookup.index:
-            explanatory_values.append(explanatory_lookup.loc[key])
-            # Report the TRUE origin year: if this row's value was
-            # carried forward from an earlier year upstream, show that
-            # earlier year rather than the nominal target year.
-            explanatory_years_used.append(
-                CARRIED_FORWARD_KEYS.get((col, row["country"], lookup_year), lookup_year))
+        chosen_year = ty - 1
+        key = (row["country"], chosen_year)
+        chosen_value = explanatory_lookup.loc[key] if key in explanatory_lookup.index else None
+        if chosen_value is not None and not pd.isna(chosen_value):
+            explanatory_values.append(chosen_value)
+            explanatory_years_used.append(chosen_year)
             keep_mask.append(True)
         else:
             explanatory_values.append(None)
@@ -907,56 +868,53 @@ block_header_rows = {}  # var_label -> its summary block's header row (12/16/20/
 
 header_row = summary_row + 1
 summary_row, cluster_props = write_clustered_time_chart(
-    wb, "ict_share", merged_ict, "ict_share", "ICT investment share", "AEC7E8", "1F77B4",
+    wb, "ict_share", merged_ict, "ict_share", "Previous-year ICT investment share", "AEC7E8", "1F77B4",
     ws_summary, summary_row, col_offset=0)
 _, yrs_props, yrs_df_ict = write_special_years_chart(
-    wb, "ict_share", forecast, ict, "ict_share", "ICT investment share", "FF7F0E",
+    wb, "ict_share", forecast, ict, "ict_share", "Previous-year ICT investment share", "FF7F0E",
     ws_summary, header_row - 1, col_offset=4)
 add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
-block_header_rows["ICT investment share"] = header_row
-all_props["ICT investment share"] = (cluster_props, yrs_props)
+block_header_rows["Previous-year ICT investment share"] = header_row
+all_props["Previous-year ICT investment share"] = (cluster_props, yrs_props)
 
 header_row = summary_row + 1
 summary_row, cluster_props = write_clustered_time_chart(
-    wb, "eur_export", merged_eur, "eur_export_share", "AI/ICT-related EU export share",
+    wb, "eur_export", merged_eur, "eur_export_share", "Previous-year AI/ICT-related EU export share",
     "FFBB78", "D62728", ws_summary, summary_row, col_offset=0)
 _, yrs_props, yrs_df_hs = write_special_years_chart(
     wb, "eur_export_share", forecast, eur_export, "eur_export_share",
-    "AI/ICT-related EU export share", "9467BD",
+    "Previous-year AI/ICT-related EU export share", "9467BD",
     ws_summary, header_row - 1, col_offset=4)
 add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
-all_props["AI/ICT-related EU export share"] = (cluster_props, yrs_props)
-block_header_rows["AI/ICT-related EU export share"] = header_row
+all_props["Previous-year AI/ICT-related EU export share"] = (cluster_props, yrs_props)
+block_header_rows["Previous-year AI/ICT-related EU export share"] = header_row
 
 header_row = summary_row + 1
 summary_row, cluster_props = write_clustered_time_chart(
     wb, "stock_corr", merged_corr, "stock_semis_corr_annual",
-    "National vs. semiconductor index correlation", "98DF8A", "2CA02C",
+    "Previous-year national vs. semiconductor index correlation", "98DF8A", "2CA02C",
     ws_summary, summary_row, col_offset=0)
 _, yrs_props, yrs_df_corr = write_special_years_chart(
     wb, "stock_corr", forecast, stock_corr_annual, "stock_semis_corr_annual",
-    "National vs. semiconductor index correlation", "8C564B",
+    "Previous-year national vs. semiconductor index correlation", "8C564B",
     ws_summary, header_row - 1, col_offset=4)
 add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
-all_props["National vs. semiconductor index correlation"] = (cluster_props, yrs_props)
-block_header_rows["National vs. semiconductor index correlation"] = header_row
+all_props["Previous-year national vs. semiconductor index correlation"] = (cluster_props, yrs_props)
+block_header_rows["Previous-year national vs. semiconductor index correlation"] = header_row
 
 header_row = summary_row + 1
 summary_row, cluster_props = write_clustered_time_chart(
     wb, "ai_inv_share", merged_ai_inv, "ai_inv_share",
-    "AI incoming investment share (per avg. quarterly GDP)", "F7B6D2", "E377C2",
+    "Previous-year AI incoming investment share (per avg. quarterly GDP)", "F7B6D2", "E377C2",
     ws_summary, summary_row, col_offset=0)
-# No substitute_year_map here -- ai_inv already has genuine 2025 data of
-# its own (confirmed directly against the source sheet), so it needs
-# neither the upstream carry_forward_missing_year() treatment that
-# ict_share gets nor classification-time substitution.
+# The special-year comparison also aligns every exposure to t-1.
 _, yrs_props, _ = write_special_years_chart(
     wb, "ai_inv_share", forecast, ai_inv, "ai_inv_share",
-    "AI incoming investment share (per avg. quarterly GDP)", "17BECF",
+    "Previous-year AI incoming investment share (per avg. quarterly GDP)", "17BECF",
     ws_summary, header_row - 1, col_offset=4)
 add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
-all_props["AI incoming investment share"] = (cluster_props, yrs_props)
-block_header_rows["AI incoming investment share"] = header_row
+all_props["Previous-year AI incoming investment share"] = (cluster_props, yrs_props)
+block_header_rows["Previous-year AI incoming investment share"] = header_row
 
 # --- Explanation of the significance markers used throughout the
 # blocks above, at the EXPLICITLY requested row 28.
@@ -985,11 +943,11 @@ ws_summary.cell(
 # above rows, starting at row 2 -- exactly matching how
 # write_clustered_time_chart()/write_special_years_chart() built them).
 j_col_specs = [
-    ("ICT investment share", "data_cluster_ict_share", "data_ict_share_yrs"),
-    ("AI/ICT-related EU export share", "data_cluster_eur_export", "data_eur_export_share_yrs"),
-    ("National vs. semiconductor index correlation", "data_cluster_stock_corr",
+    ("Previous-year ICT investment share", "data_cluster_ict_share", "data_ict_share_yrs"),
+    ("Previous-year AI/ICT-related EU export share", "data_cluster_eur_export", "data_eur_export_share_yrs"),
+    ("Previous-year national vs. semiconductor index correlation", "data_cluster_stock_corr",
      "data_stock_corr_yrs"),
-    ("AI incoming investment share", "data_cluster_ai_inv_share", "data_ai_inv_share_yrs"),
+    ("Previous-year AI incoming investment share", "data_cluster_ai_inv_share", "data_ai_inv_share_yrs"),
 ]
 
 ws_summary.cell(row=11, column=10,
@@ -1425,8 +1383,8 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
 def _standardize(series):
     """
     Z-score standardization (x - mean) / sd, per explicit instruction
-    to include X and AboveMedian as standardized variables in all six
-    regressions -- NOT the dummy/derived variables (shock_year_dummy,
+    to include X, AboveMedian, and the support_share control as standardized
+    variables in all regressions -- NOT the dummy/derived variables (shock_year_dummy,
     interaction terms), which stay in their original 0/1 or product
     scale. Mean/SD are computed on the series' own non-missing values
     (skipna, pandas default), so a NaN entry stays NaN after
@@ -1472,11 +1430,11 @@ summary_table_results = {}
 
 
 regression_specs = [
-    ("ICT investment share (data_ict_share_full)", merged_ict, "ict_share"),
-    ("AI/ICT-related EU export share (data_eur_export_full)", merged_eur, "eur_export_share"),
-    ("National vs. semiconductor index correlation (data_stock_corr_full)",
+    ("Previous-year ICT investment share (data_ict_share_full)", merged_ict, "ict_share"),
+    ("Previous-year AI/ICT-related EU export share (data_eur_export_full)", merged_eur, "eur_export_share"),
+    ("Previous-year national vs. semiconductor index correlation (data_stock_corr_full)",
      merged_corr, "stock_semis_corr_annual"),
-    ("AI incoming investment share (data_ai_inv_share_full)",
+    ("Previous-year AI incoming investment share (data_ai_inv_share_full)",
      merged_ai_inv, "ai_inv_share"),
 ]
 
@@ -1497,7 +1455,10 @@ def write_regression_data_block(regression_number, label, df_src, x_col, extra_c
     df_src to include, e.g. ["shock_year_dummy", "interaction"].
     """
     extra_cols = extra_cols or []
-    cols = ["country", "target_year", "growth_surprise", x_col] + extra_cols
+    cols = ["country", "target_year"]
+    if "explanatory_source_year" in df_src.columns:
+        cols.append("explanatory_source_year")
+    cols += ["growth_surprise", x_col] + extra_cols
     d = df_src[cols].dropna().copy()
 
     title_row = data_regr_row[0]
@@ -1518,7 +1479,7 @@ def write_regression_data_block(regression_number, label, df_src, x_col, extra_c
 
 
 ws_data_regr.column_dimensions["A"].width = 45
-for col_letter in "BCDEFG":
+for col_letter in "BCDEFGHIJKL":
     ws_data_regr.column_dimensions[col_letter].width = 16
 chart_data_row = 30  # fixed early start row -- charts now come FIRST
 
@@ -1528,7 +1489,7 @@ chart_data_row = 30  # fixed early start row -- charts now come FIRST
 # file's actual chart XML: categories/series run ACROSS a row, e.g.
 # summary!$E$31:$F$31 for categories, not down a column like this
 # script originally used) -- this version matches that layout exactly,
-# plus adds the AI incoming investment share block (not present in
+# plus adds the Previous-year AI incoming investment share block (not present in
 # that manually-built example) for consistency with every other
 # section of this sheet, and adds the interaction (line) plots below,
 # which were not built by hand.
@@ -1547,13 +1508,13 @@ def _safe_share(x, n):
     return (x / n) if n else None
 
 
-ict_cluster_props, ict_yrs_props = all_props["ICT investment share"]
+ict_cluster_props, ict_yrs_props = all_props["Previous-year ICT investment share"]
 
 variable_chart_specs = [
-    ("ICT investment share", "ICT/AI invest", "ICT/AI invest"),
-    ("AI/ICT-related EU export share", "ICT/AI  export", "ICTAI  export"),
-    ("National vs. semiconductor index correlation", "SOX correl", "SOX correl"),
-    ("AI incoming investment share", "AI equity inv", "AI equity inv"),
+    ("Previous-year ICT investment share", "ICT/AI invest", "ICT/AI invest"),
+    ("Previous-year AI/ICT-related EU export share", "ICT/AI  export", "ICTAI  export"),
+    ("Previous-year national vs. semiconductor index correlation", "SOX correl", "SOX correl"),
+    ("Previous-year AI incoming investment share", "AI equity inv", "AI equity inv"),
 ]
 ws_summary.cell(row=chart_data_row, column=1,
                  value="Chart data (LIVE formulas referencing the summary blocks below "
@@ -1581,7 +1542,7 @@ ws_summary.cell(row=full_data_row, column=1, value="Share positive surprises")
 # as an earlier, narrower version of this script did), per explicit
 # instruction; open and save the file once in Excel (or run the
 # mandatory recalc step) before relying on the charts looking right.
-ict_header_row = block_header_rows["ICT investment share"]
+ict_header_row = block_header_rows["Previous-year ICT investment share"]
 ict_data_row = ict_header_row + 1
 ws_summary.cell(row=full_data_row, column=2, value=f"=B{ict_data_row}")
 ws_summary.cell(row=full_data_row, column=3, value=f"=F{ict_data_row}")
@@ -1898,12 +1859,16 @@ ws_summary.cell(
           "raises the AVERAGE SIZE of the surprise, NOT whether X makes a "
           "positive surprise more LIKELY (that is what the LOGIT models "
           "further below, and the 'share positive surprises' blocks above, "
-          "test instead)."
+          "test instead). Every X is aligned strictly at t-1 relative to the "
+          "outcome year t; observations without that prior-year value are excluded. "
+          "The standardized State Aid control is contemporaneous at t (using the "
+          "country's 2024 value only when its 2025 value is missing)."
 ).font = Font(italic=True, size=9, color="800000")
 reg_start_row += 2
 ws_summary.cell(row=reg_start_row, column=1,
-                 value="Panel regressions: growth_surprise = const + country FE + "
-                       "time FE + beta*X").font = Font(bold=True, size=12)
+    value="Panel regressions: growth_surprise(t) = const + country FE + "
+                       "time FE + beta*X(t-1) + phi*support_share_std(t)").font = Font(
+    bold=True, size=12)
 ws_summary.cell(
     row=reg_start_row + 1, column=1,
     value="(two-way fixed effects, OLS via dummy variables; standard errors "
@@ -1912,6 +1877,7 @@ ws_summary.cell(
 
 reg_header_row = reg_start_row + 3
 reg_headers = ["Explanatory variable", "beta", "SE", "t-stat", "p-value",
+               "phi (std support_share)", "SE(phi)", "p(phi)",
                "R-squared", "N (obs)", "N (countries)", "N (years)"]
 for col_idx, h in enumerate(reg_headers, start=1):
     ws_summary.cell(row=reg_header_row, column=col_idx, value=h).font = bold
@@ -1926,8 +1892,14 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     # via extra_cols below) in the data_regr sheet for verification.
     x_col_std = x_col + "_std"
     df_src[x_col_std] = _standardize(df_src[x_col])
-    result = panel_ols_two_way_fe(df_src, "growth_surprise", x_col_std)
-    write_regression_data_block(1, label, df_src, x_col_std, extra_cols=[x_col])
+    df_src["support_share_std"] = _standardize(df_src["support_share"])
+    result = panel_ols_two_way_fe(
+        df_src, "growth_surprise", x_col_std, extra_cols=["support_share_std"])
+    phi = result["extra"]["support_share_std"]
+    write_regression_data_block(
+        1, label, df_src, x_col_std,
+        extra_cols=[x_col, "support_share", "support_share_std",
+                    "support_source_year"])
 
     row_idx = reg_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -1935,10 +1907,13 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
     ws_summary.cell(row=row_idx, column=4, value=round(result["t_stat"], 3))
     ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=6, value=round(result["r_squared"], 4))
-    ws_summary.cell(row=row_idx, column=7, value=result["n_obs"])
-    ws_summary.cell(row=row_idx, column=8, value=result["n_entities"])
-    ws_summary.cell(row=row_idx, column=9, value=result["n_periods"])
+    ws_summary.cell(row=row_idx, column=6, value=round(phi["beta"], 4))
+    ws_summary.cell(row=row_idx, column=7, value=round(phi["se"], 4))
+    ws_summary.cell(row=row_idx, column=8, value=round(phi["p_value"], 4))
+    ws_summary.cell(row=row_idx, column=9, value=round(result["r_squared"], 4))
+    ws_summary.cell(row=row_idx, column=10, value=result["n_obs"])
+    ws_summary.cell(row=row_idx, column=11, value=result["n_entities"])
+    ws_summary.cell(row=row_idx, column=12, value=result["n_periods"])
     print(f"  Panel regression ({label}): beta={result['beta']:.4f}, "
           f"p={result['p_value']:.4f}, N={result['n_obs']}")
     summary_table_results.setdefault(_clean_var_label(label), {})[4] = (result["beta"], result["p_value"])
@@ -1951,7 +1926,8 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
 # (text overflowing into an adjacent non-empty cell gets visually
 # truncated, not shown). Column I (only used by the regression table,
 # not the summary blocks) can stay narrower.
-for col_letter, width in zip("BCDEFGHI", [18, 18, 18, 18, 18, 18, 12, 12]):
+for col_letter, width in zip(
+        "BCDEFGHIJKL", [18, 18, 18, 18, 18, 18, 18, 18, 12, 12, 12]):
     ws_summary.column_dimensions[col_letter].width = width
 
 # --- Interaction regression: growth_surprise = const + country FE +
@@ -1968,11 +1944,11 @@ for col_letter, width in zip("BCDEFGHI", [18, 18, 18, 18, 18, 18, 12, 12]):
 SHOCK_YEARS_SET = set(SPECIAL_YEARS)
 
 interaction_specs = [
-    ("ICT investment share (data_ict_share_full)", merged_ict, "ict_share"),
-    ("AI/ICT-related EU export share (data_eur_export_full)", merged_eur, "eur_export_share"),
-    ("National vs. semiconductor index correlation (data_stock_corr_full)",
+    ("Previous-year ICT investment share (data_ict_share_full)", merged_ict, "ict_share"),
+    ("Previous-year AI/ICT-related EU export share (data_eur_export_full)", merged_eur, "eur_export_share"),
+    ("Previous-year national vs. semiconductor index correlation (data_stock_corr_full)",
      merged_corr, "stock_semis_corr_annual"),
-    ("AI incoming investment share (data_ai_inv_share_full)",
+    ("Previous-year AI incoming investment share (data_ai_inv_share_full)",
      merged_ai_inv, "ai_inv_share"),
 ]
 
@@ -1980,7 +1956,8 @@ reg2_start_row = reg_header_row + len(regression_specs) + 3
 ws_summary.cell(
     row=reg2_start_row, column=1,
     value="Panel regressions WITH SHOCK-YEAR INTERACTION: growth_surprise = const + "
-          "country FE + time FE + beta*X + gamma*(X*shock_year_dummy)"
+          "country FE + time FE + beta*X + gamma*(X*shock_year_dummy) + "
+          "phi*support_share_std(t)"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg2_start_row + 1, column=1,
@@ -1991,7 +1968,9 @@ ws_summary.cell(
 
 reg2_header_row = reg2_start_row + 3
 reg2_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
-                "gamma (X*shock)", "SE(gamma)", "p(gamma)", "R-squared", "N (obs)"]
+                "gamma (X*shock)", "SE(gamma)", "p(gamma)",
+                "phi (std support_share)", "SE(phi)", "p(phi)",
+                "R-squared", "N (obs)"]
 for col_idx, h in enumerate(reg2_headers, start=1):
     ws_summary.cell(row=reg2_header_row, column=col_idx, value=h).font = bold
 
@@ -2008,10 +1987,16 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     df_src[x_col_std] = _standardize(df_src[x_col])
     df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
     df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-    result = panel_ols_two_way_fe(df_src, "growth_surprise", x_col_std, extra_cols=["interaction"])
+    df_src["support_share_std"] = _standardize(df_src["support_share"])
+    result = panel_ols_two_way_fe(
+        df_src, "growth_surprise", x_col_std,
+        extra_cols=["interaction", "support_share_std"])
     gamma = result["extra"]["interaction"]
+    phi = result["extra"]["support_share_std"]
     write_regression_data_block(2, label, df_src, x_col_std,
-                                 extra_cols=[x_col, "shock_year_dummy", "interaction"])
+                                 extra_cols=[x_col, "shock_year_dummy", "interaction",
+                                             "support_share", "support_share_std",
+                                             "support_source_year"])
 
     row_idx = reg2_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2021,8 +2006,11 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
     ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
     ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=8, value=round(result["r_squared"], 4))
-    ws_summary.cell(row=row_idx, column=9, value=result["n_obs"])
+    ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
+    ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
+    ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
+    ws_summary.cell(row=row_idx, column=11, value=round(result["r_squared"], 4))
+    ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
     print(f"  Interaction regression ({label}): beta={result['beta']:.4f} "
           f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} (p={gamma['p_value']:.4f}), "
           f"N={result['n_obs']}")
@@ -2038,12 +2026,12 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
 # effect of being ABOVE MEDIAN specifically during shock years, on top
 # of beta's baseline above-median effect.
 above_median_specs = [
-    ("ICT investment share, ABOVE MEDIAN value (data_ict_share_full)", merged_ict, "ict_share"),
-    ("AI/ICT-related EU export share, ABOVE MEDIAN value (data_eur_export_full)",
+    ("Previous-year ICT investment share, ABOVE MEDIAN value (data_ict_share_full)", merged_ict, "ict_share"),
+    ("Previous-year AI/ICT-related EU export share, ABOVE MEDIAN value (data_eur_export_full)",
      merged_eur, "eur_export_share"),
-    ("National vs. semiconductor index correlation, ABOVE MEDIAN value "
+    ("Previous-year national vs. semiconductor index correlation, ABOVE MEDIAN value "
      "(data_stock_corr_full)", merged_corr, "stock_semis_corr_annual"),
-    ("AI incoming investment share, ABOVE MEDIAN value (data_ai_inv_share_full)",
+    ("Previous-year AI incoming investment share, ABOVE MEDIAN value (data_ai_inv_share_full)",
      merged_ai_inv, "ai_inv_share"),
 ]
 
@@ -2052,7 +2040,7 @@ ws_summary.cell(
     row=reg3_start_row, column=1,
     value="Panel regressions WITH ABOVE-MEDIAN VARIABLE AND SHOCK-YEAR INTERACTION: "
           "growth_surprise = const + country FE + time FE + beta*AboveMedian + "
-          "gamma*(AboveMedian*shock_year_dummy)"
+          "gamma*(AboveMedian*shock_year_dummy) + phi*support_share_std(t)"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg3_start_row + 1, column=1,
@@ -2067,7 +2055,9 @@ ws_summary.cell(
 
 reg3_header_row = reg3_start_row + 3
 reg3_headers = ["Explanatory variable", "beta (AboveMedian)", "SE(beta)", "p(beta)",
-                "gamma (AboveMedian*shock)", "SE(gamma)", "p(gamma)", "R-squared", "N (obs)"]
+                "gamma (AboveMedian*shock)", "SE(gamma)", "p(gamma)",
+                "phi (std support_share)", "SE(phi)", "p(phi)",
+                "R-squared", "N (obs)"]
 for col_idx, h in enumerate(reg3_headers, start=1):
     ws_summary.cell(row=reg3_header_row, column=col_idx, value=h).font = bold
 
@@ -2117,12 +2107,17 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     df_src["above_median"] = _standardize(df_src["above_median_raw"])
     df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
     df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-    result = panel_ols_two_way_fe(df_src, "growth_surprise", "above_median",
-                                   extra_cols=["above_x_shock"])
+    df_src["support_share_std"] = _standardize(df_src["support_share"])
+    result = panel_ols_two_way_fe(
+        df_src, "growth_surprise", "above_median",
+        extra_cols=["above_x_shock", "support_share_std"])
     gamma = result["extra"]["above_x_shock"]
+    phi = result["extra"]["support_share_std"]
     write_regression_data_block(3, label, df_src, "above_median",
                                  extra_cols=[x_col, "above_median_raw",
-                                             "shock_year_dummy", "above_x_shock"])
+                                             "shock_year_dummy", "above_x_shock",
+                                             "support_share", "support_share_std",
+                                             "support_source_year"])
 
     row_idx = reg3_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2132,8 +2127,11 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
     ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
     ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=8, value=round(result["r_squared"], 4))
-    ws_summary.cell(row=row_idx, column=9, value=result["n_obs"])
+    ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
+    ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
+    ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
+    ws_summary.cell(row=row_idx, column=11, value=round(result["r_squared"], 4))
+    ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
     print(f"  Above-median interaction regression ({label}): beta={result['beta']:.4f} "
           f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} (p={gamma['p_value']:.4f}), "
           f"N={result['n_obs']}, median={median_val:.4f}")
@@ -2153,7 +2151,7 @@ ws_summary.cell(
     row=probit_primary_start_row, column=1,
     value="PROBIT versions of the three panel regressions above: "
           "P(growth_surprise > 0) = Phi(const + country FE + time FE + beta*X "
-          "[+ gamma*interaction])"
+          "[+ gamma*interaction] + phi*support_share_std(t))"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=probit_primary_start_row + 1, column=1,
@@ -2178,10 +2176,12 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
     probit_primary_header_row = probit_primary_current_row + 1
     if interaction_col_name is None:
         probit_primary_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)",
-                          "p(beta)", "Pseudo R-sq", "N (obs)"]
+                          "p(beta)", "phi (std support_share)", "SE(phi)", "p(phi)",
+                          "Pseudo R-sq", "N (obs)"]
     else:
         probit_primary_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
                           f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)",
+                          "phi (std support_share)", "SE(phi)", "p(phi)",
                           "Pseudo R-sq", "N (obs)"]
     for col_idx, h in enumerate(probit_primary_headers, start=1):
         ws_summary.cell(row=probit_primary_header_row, column=col_idx, value=h).font = bold
@@ -2195,14 +2195,21 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
         if interaction_col_name is None:
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
-            result = panel_probit_two_way_fe(df_src, "growth_surprise", x_col_std)
+            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            result = panel_probit_two_way_fe(
+                df_src, "growth_surprise", x_col_std,
+                extra_cols=["support_share_std"])
+            phi = result["extra"]["support_share_std"]
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=6, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=7, value=result["n_obs"])
+            ws_summary.cell(row=row_idx, column=6, value=round(phi["beta"], 4))
+            ws_summary.cell(row=row_idx, column=7, value=round(phi["se"], 4))
+            ws_summary.cell(row=row_idx, column=8, value=round(phi["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=9, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=10, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), N={result['n_obs']}")
             summary_table_results.setdefault(_clean_var_label(label), {})[1] = (
@@ -2212,9 +2219,12 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-            result = panel_probit_two_way_fe(df_src, "growth_surprise", x_col_std,
-                                             extra_cols=["interaction"])
+            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            result = panel_probit_two_way_fe(
+                df_src, "growth_surprise", x_col_std,
+                extra_cols=["interaction", "support_share_std"])
             gamma = result["extra"]["interaction"]
+            phi = result["extra"]["support_share_std"]
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2222,8 +2232,11 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=result["n_obs"])
+            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
+            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
+            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}")
@@ -2241,9 +2254,12 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src["above_median"] = _standardize(df_src["above_median_raw"])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-            result = panel_probit_two_way_fe(df_src, "growth_surprise", "above_median",
-                                             extra_cols=["above_x_shock"])
+            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            result = panel_probit_two_way_fe(
+                df_src, "growth_surprise", "above_median",
+                extra_cols=["above_x_shock", "support_share_std"])
             gamma = result["extra"]["above_x_shock"]
+            phi = result["extra"]["support_share_std"]
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2251,8 +2267,11 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=result["n_obs"])
+            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
+            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
+            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}, median={median_val:.4f}")
@@ -2322,10 +2341,10 @@ ws_summary.cell(row=subheader_row, column=1).border = bottom_border
 # stock_corr/ai_inv, unchanged, everywhere else in this script; only
 # THIS table's display order/names differ).
 table_display_names = [
-    ("ICT investment share", "ICT/AI-related investment"),
-    ("AI incoming investment share", "Equity investments in AI"),
-    ("AI/ICT-related EU export share", "ICT/AI-related export"),
-    ("National vs. semiconductor index correlation", "Correlation semiconductor index"),
+    ("Previous-year ICT investment share", "ICT/AI-related investment"),
+    ("Previous-year AI incoming investment share", "Equity investments in AI"),
+    ("Previous-year AI/ICT-related EU export share", "ICT/AI-related export"),
+    ("Previous-year national vs. semiconductor index correlation", "Correlation semiconductor index"),
 ]
 data_first_row = subheader_row + 2
 for row_offset, (internal_label, display_label) in enumerate(table_display_names):
@@ -2355,7 +2374,8 @@ note_lines = [
     "Note: Coefficient shown is beta for models (1) and (4) (the plain-X "
     "specification), and gamma (the interaction-term coefficient) for models "
     "(2), (3), (5), and (6). Significance: * p<0.10, ** p<0.05, *** p<0.01.",
-    "(4) OLS, plain X: growth_surprise = const + country FE + time FE + beta*X.",
+    "(4) OLS, plain X: growth_surprise = const + country FE + time FE + beta*X "
+    "+ phi*support_share_std.",
     "(5) OLS, X + shock-year interaction: adds gamma*(X*shock_year_dummy) to (4); "
     "gamma is the ADDITIONAL effect of X specifically during shock years.",
     # Split across two lines, same reasoning/layout as (1) below: this
@@ -2381,6 +2401,13 @@ note_lines = [
     "same finite-sample cluster correction is used for all three estimators.",
     "     OLS p-values use a t distribution with number-of-countries minus one degrees "
     "of freedom; probit and logit report their conventional cluster-robust z tests.",
+    "Timing: each focal explanatory variable X is the country's observed value in t-1 "
+    "for an outcome in year t; missing t-1 values are excluded from the relevant "
+    "chart, test, and regression.",
+    "     AboveMedian_raw is constructed from that same t-1 explanatory value, and "
+    "shock interactions multiply the lagged exposure by the outcome-year shock dummy; "
+    "support_share is contemporaneous at t (2024 if 2025 is missing), standardized, "
+    "and its phi is omitted only from the compact Regression results table.",
     # Explanatory note on standardization, per explicit instruction --
     # split across several lines, same wrapping reasoning as the notes
     # above.
@@ -2391,7 +2418,8 @@ note_lines = [
     "shock_year_dummy and the interaction terms themselves (X*shock_year_dummy, "
     "AboveMedian*shock_year_dummy) are NOT separately standardized, since they are",
     "     dummy/product terms, not the continuous explanatory variables the "
-    "standardization was requested for.",
+    "standardization was requested for; support_share is also standardized before entry, "
+    "with phi, SE(phi), and p(phi) reported in the detailed tables.",
     "For OLS (models 4-6): this means beta is directly interpretable as \"a "
     "one-standard-deviation increase in X is associated with a beta-unit change in "
     "growth_surprise (in its own original units), holding other variables constant.\"",
@@ -2458,10 +2486,12 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
     logit_robustness_header_row = logit_robustness_current_row + 1
     if interaction_col_name is None:
         logit_robustness_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)",
-                           "p(beta)", "Pseudo R-sq", "N (obs)"]
+                           "p(beta)", "phi (std support_share)", "SE(phi)", "p(phi)",
+                           "Pseudo R-sq", "N (obs)"]
     else:
         logit_robustness_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
                            f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)",
+                           "phi (std support_share)", "SE(phi)", "p(phi)",
                            "Pseudo R-sq", "N (obs)"]
     for col_idx, h in enumerate(logit_robustness_headers, start=1):
         ws_summary.cell(row=logit_robustness_header_row, column=col_idx, value=h).font = bold
@@ -2475,14 +2505,21 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
         if interaction_col_name is None:
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
-            result = panel_logit_two_way_fe(df_src, "growth_surprise", x_col_std)
+            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            result = panel_logit_two_way_fe(
+                df_src, "growth_surprise", x_col_std,
+                extra_cols=["support_share_std"])
+            phi = result["extra"]["support_share_std"]
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=6, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=7, value=result["n_obs"])
+            ws_summary.cell(row=row_idx, column=6, value=round(phi["beta"], 4))
+            ws_summary.cell(row=row_idx, column=7, value=round(phi["se"], 4))
+            ws_summary.cell(row=row_idx, column=8, value=round(phi["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=9, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=10, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), N={result['n_obs']}")
         elif interaction_col_name == "interaction":
@@ -2490,9 +2527,12 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-            result = panel_logit_two_way_fe(df_src, "growth_surprise", x_col_std,
-                                              extra_cols=["interaction"])
+            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            result = panel_logit_two_way_fe(
+                df_src, "growth_surprise", x_col_std,
+                extra_cols=["interaction", "support_share_std"])
             gamma = result["extra"]["interaction"]
+            phi = result["extra"]["support_share_std"]
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2500,8 +2540,11 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=result["n_obs"])
+            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
+            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
+            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}")
@@ -2513,9 +2556,12 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             df_src["above_median"] = _standardize(df_src["above_median_raw"])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-            result = panel_logit_two_way_fe(df_src, "growth_surprise", "above_median",
-                                              extra_cols=["above_x_shock"])
+            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            result = panel_logit_two_way_fe(
+                df_src, "growth_surprise", "above_median",
+                extra_cols=["above_x_shock", "support_share_std"])
             gamma = result["extra"]["above_x_shock"]
+            phi = result["extra"]["support_share_std"]
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2523,8 +2569,11 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=result["n_obs"])
+            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
+            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
+            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}, median={median_val:.4f}")

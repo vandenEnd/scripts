@@ -10,7 +10,7 @@ this project's scripts (the local-data modeling scripts) expect: gdp,
 ict_inv, ai_patent, ai_inv, index_nat, index_sox, index_msci,
 index_stoxx600, hs_export, eur_export, wui, gpr, epu, tpu, gscpi, com,
 trade_openness, population_growth, productivity_growth, gdp_per_capita,
-infl.
+infl, support.
 
 THIS SCRIPT DOES NOT MODEL ANYTHING: no panel construction, no local
 projections, no IRFs, no regressions, no charts. It is purely a data-
@@ -63,6 +63,9 @@ import os
 import itertools
 import time
 import datetime
+import json
+import uuid
+from http.cookies import SimpleCookie
 from pathlib import Path
 
 
@@ -81,10 +84,12 @@ install_if_needed("numpy")
 install_if_needed("openpyxl")
 install_if_needed("xlsxwriter")
 install_if_needed("yfinance")
+install_if_needed("websocket-client", "websocket")
 
 import numpy as np
 import pandas as pd
 import requests
+import websocket
 
 # ----------------------------------------------------------------------
 # 0. CONFIG (identical across all six source scripts -- verified --
@@ -161,6 +166,14 @@ ISO3_TO_ISO2 = {
     "IRL": "IE", "FIN": "FI", "PRT": "PT",
 }
 COUNTRIES_ISO3 = list(ISO3_TO_ISO2.keys())
+
+# European Commission State Aid Scoreboard (Qlik public dashboard).
+STATE_AID_START_YEAR = 2000
+STATE_AID_END_YEAR = 2024
+STATE_AID_HOST = "dashboard.tech.ec.europa.eu"
+STATE_AID_PREFIX = "/qs_digit_dashboard_mt/public/"
+STATE_AID_APP_ID = "8d6e06f5-8793-4d78-88c5-1ab928742900"
+STATE_AID_EXPORT_OBJECT_ID = "pxcFPu"
 
 
 # ----------------------------------------------------------------------
@@ -2193,6 +2206,256 @@ def fetch_hicp_index():
     return result
 
 
+# ----------------------------------------------------------------------
+# EU State Aid Scoreboard support share
+# ----------------------------------------------------------------------
+
+def _state_aid_get_with_retry(client, url, *, attempts=4, backoff=2.0,
+                              **kwargs):
+    """GET with retries for transient connection failures and throttling."""
+    last_error = None
+    for attempt in range(1, attempts + 1):
+        try:
+            response = client.get(url, **kwargs)
+            if response.status_code in {429, 500, 502, 503, 504}:
+                response.raise_for_status()
+            return response
+        except (requests.ConnectionError, requests.Timeout,
+                requests.exceptions.ChunkedEncodingError,
+                requests.HTTPError) as exc:
+            last_error = exc
+            if attempt == attempts:
+                break
+            wait = backoff ** (attempt - 1)
+            print(f"  [!] State Aid download error ({exc}); "
+                  f"retrying in {wait:.0f}s...")
+            time.sleep(wait)
+    raise last_error
+
+
+def _qlik_rpc(ws, request_id, handle, method, params):
+    """Send one QIX JSON-RPC request, ignoring async notifications."""
+    ws.send(json.dumps({
+        "jsonrpc": "2.0", "id": request_id, "handle": handle,
+        "method": method, "params": params,
+    }))
+    while True:
+        message = json.loads(ws.recv())
+        if message.get("id") != request_id:
+            continue
+        if "error" in message:
+            raise RuntimeError(
+                f"Qlik {method} failed: "
+                f"{message['error'].get('message', message['error'])}")
+        return message["result"]
+
+
+def _read_state_aid_export(content):
+    """Read the official OOXML export and locate its header row."""
+    workbook = pd.ExcelFile(io.BytesIO(content))
+    for sheet_name in workbook.sheet_names:
+        preview = pd.read_excel(
+            workbook, sheet_name=sheet_name, header=None, nrows=15)
+        for header_row, row in preview.iterrows():
+            labels = {str(value).strip().lower() for value in row.dropna()}
+            if (any("member state" in label for label in labels)
+                    and any("expenditure year" in label for label in labels)):
+                return pd.read_excel(
+                    workbook, sheet_name=sheet_name, header=header_row)
+    raise ValueError(
+        "The State Aid Scoreboard export no longer contains the expected "
+        "Member State and Expenditure Year columns. Its schema may have changed.")
+
+
+def _find_state_aid_column(columns, required_terms, forbidden_terms=()):
+    for column in columns:
+        label = " ".join(str(column).lower().replace("_", " ").split())
+        if (all(term in label for term in required_terms)
+                and not any(term in label for term in forbidden_terms)):
+            return column
+    return None
+
+
+def _resolve_qlik_export_url(export_url):
+    """Route a temporary export through the dashboard virtual proxy."""
+    parsed = requests.utils.urlparse(export_url)
+    path = parsed.path
+    if path.startswith("/tempcontent/"):
+        path = STATE_AID_PREFIX.rstrip("/") + path
+    elif not path.startswith(STATE_AID_PREFIX):
+        path = STATE_AID_PREFIX.rstrip("/") + "/" + path.lstrip("/")
+    return requests.utils.urlunparse((
+        "https", STATE_AID_HOST, path, parsed.params,
+        parsed.query, parsed.fragment,
+    ))
+
+
+def _fetch_state_aid_scoreboard_export():
+    """Download the Commission dashboard's disaggregated statistics."""
+    base_url = f"https://{STATE_AID_HOST}{STATE_AID_PREFIX}"
+    mashup_url = (
+        base_url + "extensions/COMP_Scoreboard_MT/COMP_Scoreboard_MT.html")
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 EU-State-Aid-data-collector",
+    })
+    landing = _state_aid_get_with_retry(session, mashup_url, timeout=60)
+    landing.raise_for_status()
+
+    csrf_token = landing.headers.get("qlik-csrf-token")
+    if not csrf_token:
+        try:
+            token_response = _state_aid_get_with_retry(
+                session, base_url + "qps/csrftoken", timeout=30,
+                headers={"Origin": f"https://{STATE_AID_HOST}"})
+            if token_response.ok:
+                csrf_token = token_response.headers.get("qlik-csrf-token")
+        except requests.RequestException:
+            pass
+
+    identity = str(uuid.uuid4())
+    ws_url = (f"wss://{STATE_AID_HOST}{STATE_AID_PREFIX}app/"
+              f"{STATE_AID_APP_ID}/identity/{identity}")
+    if csrf_token:
+        ws_url += f"?qlik-csrf-token={csrf_token}"
+
+    cookie = "; ".join(
+        f"{name}={value}" for name, value in session.cookies.items())
+    extra_headers = [f"User-Agent: {session.headers['User-Agent']}"]
+    if csrf_token:
+        extra_headers.append(f"qlik-csrf-token: {csrf_token}")
+
+    ws = websocket.create_connection(
+        ws_url, timeout=90, origin=f"https://{STATE_AID_HOST}",
+        cookie=cookie or None, header=extra_headers)
+    try:
+        opened = _qlik_rpc(
+            ws, 1, -1, "OpenDoc", [STATE_AID_APP_ID, "", "", "", False])
+        app_handle = opened["qReturn"]["qHandle"]
+        export_object = _qlik_rpc(
+            ws, 2, app_handle, "GetObject", [STATE_AID_EXPORT_OBJECT_ID])
+        object_handle = export_object["qReturn"]["qHandle"]
+        exported = _qlik_rpc(
+            ws, 3, object_handle, "ExportData", ["OOXML", "", "", "A"])
+
+        # The URL is short-lived and tied to this live engine session.
+        # Propagate cookies from the WebSocket upgrade and download through
+        # the same virtual-proxy prefix; root /tempcontent returns HTTP 403.
+        handshake_headers = ws.getheaders() or {}
+        set_cookie_headers = []
+        for header_name, header_value in handshake_headers.items():
+            if header_name.lower() == "set-cookie":
+                if isinstance(header_value, (list, tuple)):
+                    set_cookie_headers.extend(header_value)
+                else:
+                    set_cookie_headers.append(header_value)
+        for set_cookie in set_cookie_headers:
+            parsed_cookie = SimpleCookie()
+            parsed_cookie.load(set_cookie)
+            for name, morsel in parsed_cookie.items():
+                session.cookies.set(
+                    name, morsel.value, domain=STATE_AID_HOST,
+                    path=morsel["path"] or "/")
+
+        download_url = _resolve_qlik_export_url(exported["qUrl"])
+        response = _state_aid_get_with_retry(
+            session, download_url, timeout=180,
+            headers={
+                "Referer": mashup_url,
+                "Origin": f"https://{STATE_AID_HOST}",
+                "Accept": ("application/vnd.openxmlformats-officedocument."
+                           "spreadsheetml.sheet,application/octet-stream,*/*"),
+            })
+        if response.status_code == 403:
+            raise requests.HTTPError(
+                "The State Aid export was rejected with HTTP 403 even through "
+                "the Qlik virtual proxy. The dashboard's public-access setup "
+                "may have changed. Attempted URL: " + download_url,
+                response=response)
+        response.raise_for_status()
+        content = response.content
+    finally:
+        ws.close()
+    return _read_state_aid_export(content)
+
+
+def fetch_government_support_share():
+    """Return State aid expenditure and its GDP share for 2000-2024."""
+    raw = _fetch_state_aid_scoreboard_export()
+    country_col = _find_state_aid_column(raw.columns, ("member", "state"))
+    year_col = _find_state_aid_column(raw.columns, ("expenditure", "year"))
+    aid_col = _find_state_aid_column(
+        raw.columns, ("aid", "current"),
+        ("constant", "%", "gdp", "nominal"))
+    if aid_col is None:
+        aid_col = _find_state_aid_column(
+            raw.columns, ("aid", "element"),
+            ("constant", "%", "gdp", "nominal"))
+    if country_col is None or year_col is None or aid_col is None:
+        raise ValueError(
+            "Could not identify the country, year and current-price aid "
+            f"columns in the Scoreboard export. Columns: {list(raw.columns)}")
+
+    state_aid = raw[[country_col, year_col, aid_col]].copy()
+    state_aid.columns = ["country_name", "year", "state_aid_m_eur"]
+    name_to_iso2 = {name: code for code, name in COUNTRY_NAME_MAP.items()}
+    state_aid["country"] = (
+        state_aid["country_name"].astype(str).str.strip().map(name_to_iso2))
+    state_aid["year"] = pd.to_numeric(state_aid["year"], errors="coerce")
+    state_aid["state_aid_m_eur"] = pd.to_numeric(
+        state_aid["state_aid_m_eur"].astype(str)
+        .str.replace("\u00a0", "", regex=False)
+        .str.replace(",", "", regex=False), errors="coerce")
+    state_aid = state_aid[
+        state_aid["country"].isin(COUNTRIES)
+        & state_aid["year"].between(
+            STATE_AID_START_YEAR, STATE_AID_END_YEAR)
+    ].dropna(subset=["state_aid_m_eur"])
+    state_aid = (state_aid.groupby(["country", "year"], as_index=False)
+                 ["state_aid_m_eur"].sum())
+    state_aid["year"] = state_aid["year"].astype(int)
+
+    gdp_raw = eurostat_json_to_df("nama_10_gdp", {
+        "freq": "A", "unit": "CP_MEUR", "na_item": "B1GQ",
+        "geo": COUNTRIES,
+        "sinceTimePeriod": str(STATE_AID_START_YEAR),
+        "untilTimePeriod": str(STATE_AID_END_YEAR),
+    })
+    gdp = gdp_raw.rename(columns={"geo": "country", "time": "year"})
+    gdp["year"] = pd.to_numeric(gdp["year"], errors="coerce")
+    gdp["gdp_m_eur"] = pd.to_numeric(gdp["value"], errors="coerce")
+    gdp = gdp[["country", "year", "gdp_m_eur"]].dropna()
+    gdp["year"] = gdp["year"].astype(int)
+
+    output = state_aid.merge(gdp, on=["country", "year"], how="left")
+    output["support_share"] = (
+        output["state_aid_m_eur"] / output["gdp_m_eur"])
+    output = output[[
+        "country", "year", "state_aid_m_eur", "gdp_m_eur",
+        "support_share",
+    ]].sort_values(["country", "year"]).reset_index(drop=True)
+
+    expected = {
+        (country, year) for country in COUNTRIES
+        for year in range(STATE_AID_START_YEAR, STATE_AID_END_YEAR + 1)
+    }
+    actual = set(output[["country", "year"]].itertuples(
+        index=False, name=None))
+    missing = sorted(expected - actual)
+    unexpected = sorted(actual - expected)
+    if missing or unexpected:
+        raise ValueError(
+            "State Aid output does not have the required balanced 2000-2024 "
+            f"panel. Missing={missing[:15]}; unexpected={unexpected[:15]}")
+    if output["gdp_m_eur"].isna().any() or output["support_share"].isna().any():
+        raise ValueError("Nominal GDP is missing for at least one State Aid row.")
+
+    print(f"  [diagnostic] Government support: {len(output)} observations, "
+          f"{output['country'].nunique()} countries, "
+          f"{output['year'].min()}-{output['year'].max()}.")
+    return output
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("DATA COLLECTION -- fetching every raw series this project uses")
@@ -2200,68 +2463,71 @@ if __name__ == "__main__":
 
     sheets = {}
 
-    print("\n[1/21] GDP level (Eurostat)...")
+    print("\n[1/22] GDP level (Eurostat)...")
     sheets["gdp"] = fetch_gdp_level()
 
-    print("\n[2/21] ICT investment share (Eurostat)...")
+    print("\n[2/22] ICT investment share (Eurostat)...")
     sheets["ict_inv"] = fetch_ict_investment_share()
 
-    print("\n[3/21] AI patent applications (ETO/CSET, local file)...")
+    print("\n[3/22] AI patent applications (ETO/CSET, local file)...")
     sheets["ai_patent"] = fetch_ai_patents()
 
-    print("\n[4/21] AI incoming investment counts (ETO/CSET, local file)...")
+    print("\n[4/22] AI incoming investment counts (ETO/CSET, local file)...")
     sheets["ai_inv"] = fetch_ai_investment(sheets["gdp"])
 
-    print("\n[5/21] National equity indices (Yahoo Finance)...")
+    print("\n[5/22] National equity indices (Yahoo Finance)...")
     sheets["index_nat"] = fetch_national_indices_raw()
 
-    print("\n[6/21] Semiconductor index ^SOX (Yahoo Finance)...")
+    print("\n[6/22] Semiconductor index ^SOX (Yahoo Finance)...")
     sheets["index_sox"] = fetch_semiconductor_raw()
 
-    print("\n[7/21] MSCI World index (Yahoo Finance)...")
+    print("\n[7/22] MSCI World index (Yahoo Finance)...")
     sheets["index_msci"] = fetch_msci_world_raw()
 
-    print("\n[8/21] STOXX Europe 600 index (Yahoo Finance)...")
+    print("\n[8/22] STOXX Europe 600 index (Yahoo Finance)...")
     sheets["index_stoxx600"] = fetch_stoxx600_raw()
 
-    print("\n[9/21] AI/ICT-related HS2022 export data (Comext DS-059341)...")
+    print("\n[9/22] AI/ICT-related HS2022 export data (Comext DS-059341)...")
     sheets["hs_export"] = fetch_hs_export_data()
 
-    print("\n[10/21] CPA 2.2 EU export data, intra-/extra-EU (Comext DS-059366)...")
+    print("\n[10/22] CPA 2.2 EU export data, intra-/extra-EU (Comext DS-059366)...")
     sheets["eur_export"] = fetch_eur_export_data()
 
-    print("\n[11/21] World Uncertainty Index (WUI)...")
+    print("\n[11/22] World Uncertainty Index (WUI)...")
     sheets["wui"] = fetch_wui_global()
 
-    print("\n[12/21] Geopolitical Risk Index (GPR)...")
+    print("\n[12/22] Geopolitical Risk Index (GPR)...")
     sheets["gpr"] = fetch_gpr_global()
 
-    print("\n[13/21] Economic Policy Uncertainty Index (EPU)...")
+    print("\n[13/22] Economic Policy Uncertainty Index (EPU)...")
     sheets["epu"] = fetch_epu_global()
 
-    print("\n[14/21] Trade Policy Uncertainty Index (TPU)...")
+    print("\n[14/22] Trade Policy Uncertainty Index (TPU)...")
     sheets["tpu"] = fetch_tpu_global()
 
-    print("\n[15/21] Global Supply Chain Pressure Index (GSCPI)...")
+    print("\n[15/22] Global Supply Chain Pressure Index (GSCPI)...")
     sheets["gscpi"] = fetch_gscpi_global()
 
-    print("\n[16/21] Global commodity price index, incl. oil and gas (FRED)...")
+    print("\n[16/22] Global commodity price index, incl. oil and gas (FRED)...")
     sheets["com"] = fetch_commodity_price_index()
 
-    print("\n[17/21] Trade openness (World Bank)...")
+    print("\n[17/22] Trade openness (World Bank)...")
     sheets["trade_openness"] = fetch_trade_openness()
 
-    print("\n[18/21] Population growth (World Bank)...")
+    print("\n[18/22] Population growth (World Bank)...")
     sheets["population_growth"] = fetch_population_growth()
 
-    print("\n[19/21] Labor productivity growth: real productivity per hour worked, YoY (Eurostat)...")
+    print("\n[19/22] Labor productivity growth: real productivity per hour worked, YoY (Eurostat)...")
     sheets["productivity_growth"] = fetch_productivity_growth()
 
-    print("\n[20/21] GDP per capita (Eurostat)...")
+    print("\n[20/22] GDP per capita (Eurostat)...")
     sheets["gdp_per_capita"] = fetch_gdp_per_capita()
 
-    print("\n[21/21] HICP index level, 2015=100 (Eurostat)...")
+    print("\n[21/22] HICP index level, 2015=100 (Eurostat)...")
     sheets["infl"] = fetch_hicp_index()
+
+    print("\n[22/22] EU State Aid Scoreboard support share...")
+    sheets["support"] = fetch_government_support_share()
 
     # Convert any Period-typed "quarter" columns to plain strings
     # (e.g. "2000Q1") for Excel -- matches the existing ai_data.xlsx
