@@ -48,7 +48,7 @@ for its original provenance):
     ..._TPU_pure_cum.py        -> TPU, ICT investment share
     ..._EPU_pure_cum.py        -> EPU
     ..._GSCPI_pure_cum.py      -> GSCPI
-    hs_export.py               -> AI/ICT-related HS export data (BIMTS)
+    hs_export.py               -> AI/ICT-related HS2022 export data (Comext)
 
 LOCAL FILES REQUIRED next to this script (not fetched over the
 network): eto_patent.csv, eto_inv.csv (ETO/CSET Country Activity
@@ -1541,119 +1541,105 @@ def fetch_stoxx600_raw():
 
 
 # ----------------------------------------------------------------------
-# 6. AI/ICT-related HS export data (OECD BIMTS)
+# 6. AI/ICT-related HS export data (Eurostat Comext, HS2022)
 # ----------------------------------------------------------------------
+
+HS_EXPORT_DATASET = "DS-059341"
 
 def fetch_hs_export_data():
     """
-    HS 847150+847180+847330+848610+848620+848630+848640+848690 exports
-    AND total merchandise exports ("_T") -- all from the SAME BIMTS
-    source, in one request -- for the 7 target countries to the World,
-    2000-onward. From hs_export.py (adapted here to RETURN a DataFrame
-    rather than writing directly to the workbook itself, so this
-    collection script can write every sheet in one unified step at the
-    end).
+    HS2022 847150+847180+847330+848610+848620+848630+848640+848690
+    exports and total merchandise exports to the World for the target
+    countries and all available years through 2025.
+
+    Source: Eurostat Comext DS-059341, "International trade of EU and
+    non-EU countries since 2002 by HS2-4-6". The previous OECD BIMTS
+    HS2017 dataflow ended at 2024; Comext supplies the requested detailed
+    products for 2025. Comext expects bare six-digit product codes (not
+    the OECD-specific ``HS17_``/``HS22_`` prefixes) and ``TOTAL`` for all
+    merchandise. Each reporter/product is requested separately because
+    this API returns zero observations for "+"-joined filters; all years
+    are requested together to keep the total number of calls manageable.
     """
-    ref_area = "+".join(COUNTRIES_ISO3)
-    product_hs = "+".join(f"HS17_{code}" for code in HS_CODES) + "+_T"
-    key = f"{ref_area}.W..C..{product_hs}.A.USD_EXC."
+    start_year = max(2002, int(SAMPLE_START[:4]))
+    end_year = min(2025, int(SAMPLE_END[:4]))
+    product_codes = HS_CODES + ["TOTAL"]
+    all_rows = []
+    failed_requests = []
+    total_requests = len(COUNTRIES) * len(product_codes)
+    request_num = 0
 
-    url = (
-        "https://sdmx.oecd.org/sti-public/rest/data/"
-        "OECD.SDD.TPS,DSD_BIMTS_6D@DF_BIMTS_HS2017_6D,1.0/"
-        f"{key}"
-    )
-    params = {
-        "startPeriod": "2000",
-        "dimensionAtObservation": "AllDimensions",
-        "format": "csvfilewithlabels",
-    }
+    print(f"  [diagnostic] Fetching HS2022 exports from {HS_EXPORT_DATASET}: "
+          f"{total_requests} reporter/product requests covering "
+          f"{start_year}-{end_year}.")
 
-    print("  Requesting BIMTS HS export data:")
-    print(f"    {url}")
+    for country in COUNTRIES:
+        for product_code in product_codes:
+            request_num += 1
+            params = {
+                "format": "JSON",
+                "freq": "A",
+                "reporter": country,
+                "partner": "WORLD",
+                "product": product_code,
+                "flow": "2",  # export
+                "indicators": "VALUE_EUR",
+                "sinceTimePeriod": str(start_year),
+                "untilTimePeriod": str(end_year),
+            }
+            try:
+                part = eurostat_json_to_df(
+                    HS_EXPORT_DATASET, params, base_url=COMEXT_BASE
+                )
+            except (ValueError, requests.exceptions.RequestException) as e:
+                print(f"  [!] WARNING: {HS_EXPORT_DATASET} request for "
+                      f"{country}/{product_code} failed: {e}")
+                failed_requests.append((country, product_code))
+                continue
+            all_rows.append(part)
+            time.sleep(0.05)
+        print(f"  [diagnostic] ...{country} done "
+              f"({request_num}/{total_requests} requests).")
 
-    headers = {
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                       "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
-        "Accept": "text/csv,application/csv,text/plain,*/*",
-    }
-
-    try:
-        r = requests.get(url, params=params, headers=headers, timeout=120)
-    except requests.exceptions.RequestException as e:
+    if not all_rows:
         raise SystemExit(
-            f"\nfetch_hs_export_data: network request failed: "
-            f"{e.__class__.__name__}: {e}"
+            f"\nfetch_hs_export_data: every {HS_EXPORT_DATASET} request failed."
         )
+    if failed_requests:
+        print(f"  [!] WARNING: {len(failed_requests)} reporter/product "
+              f"request(s) returned no data: {failed_requests}")
 
-    if r.status_code != 200:
-        raise SystemExit(
-            f"\nfetch_hs_export_data: request failed with HTTP {r.status_code}.\n"
-            f"Response body (first 2000 chars):\n{r.text[:2000]}"
-        )
-
-    df = pd.read_csv(io.StringIO(r.text))
-    if df.empty:
-        raise SystemExit(
-            "\nfetch_hs_export_data: request succeeded (HTTP 200) but "
-            "returned ZERO rows."
-        )
-
-    cols_upper = {str(c).strip().upper(): c for c in df.columns}
-
-    def find_col(*candidates):
-        for cand in candidates:
-            if cand in cols_upper:
-                return cols_upper[cand]
-        return None
-
-    col_ref_area = find_col("REF_AREA", "REFERENCE AREA", "REFERENCE_AREA")
-    col_trade_flow = find_col("TRADE_FLOW", "TRADE FLOW")
-    col_product_hs = find_col("PRODUCT_HS", "PRODUCT HS", "HS PRODUCT")
-    col_adjustment = find_col("ADJUSTMENT")
-    col_time = find_col("TIME_PERIOD", "TIME PERIOD")
-    col_value = find_col("OBS_VALUE", "OBSERVATION VALUE")
-
-    missing = [name for name, col in [
-        ("REF_AREA", col_ref_area), ("TRADE_FLOW", col_trade_flow),
-        ("PRODUCT_HS", col_product_hs), ("TIME_PERIOD", col_time),
-        ("OBS_VALUE", col_value),
-    ] if col is None]
+    filtered = pd.concat(all_rows, ignore_index=True)
+    required = {"reporter", "product", "time", "value"}
+    missing = required - set(filtered.columns)
     if missing:
         raise SystemExit(
-            f"\nfetch_hs_export_data: could not find expected column(s) "
-            f"{missing} in the response. Actual columns: {list(df.columns)}"
+            f"\nfetch_hs_export_data: {HS_EXPORT_DATASET} response is missing "
+            f"required columns {sorted(missing)}. Actual columns: "
+            f"{list(filtered.columns)}"
+        )
+    filtered["country"] = filtered["reporter"].astype(str).str.strip().str.upper()
+    filtered["hs_code_raw"] = filtered["product"].astype(str).str.strip().str.upper()
+    filtered["year"] = pd.to_numeric(filtered["time"], errors="coerce").astype("Int64")
+    filtered["value_eur"] = pd.to_numeric(filtered["value"], errors="coerce")
+    filtered = filtered.dropna(
+        subset=["country", "hs_code_raw", "year", "value_eur"]
+    )
+
+    if end_year >= 2025 and not (filtered["year"] == 2025).any():
+        raise SystemExit(
+            f"\nfetch_hs_export_data: {HS_EXPORT_DATASET} returned no 2025 "
+            "observations, although 2025 was explicitly requested."
         )
 
-    df[col_trade_flow] = df[col_trade_flow].astype(str).str.strip().str.upper()
-    mask = df[col_trade_flow] == "X"
-
-    if col_adjustment is not None:
-        df[col_adjustment] = df[col_adjustment].astype(str).str.strip().str.upper()
-        adj_mask = df[col_adjustment] == "B_ADJ_RX"
-        if adj_mask.any():
-            mask &= adj_mask
-        else:
-            print("  [!] WARNING: 'B_ADJ_RX' not found in ADJUSTMENT -- "
-                  "proceeding WITHOUT that filter.")
-
-    filtered = df.loc[mask].copy()
-    if filtered.empty:
-        raise SystemExit("\nfetch_hs_export_data: zero rows remain after filtering.")
-
-    filtered["country"] = filtered[col_ref_area].astype(str).str.strip().str.upper().map(ISO3_TO_ISO2)
-    filtered["hs_code_raw"] = filtered[col_product_hs].astype(str).str.strip().str.upper()
-    filtered["year"] = pd.to_numeric(filtered[col_time], errors="coerce").astype("Int64")
-    filtered["value_usd"] = pd.to_numeric(filtered[col_value], errors="coerce")
-    filtered = filtered.dropna(subset=["country", "hs_code_raw", "year", "value_usd"])
-
     wide = filtered.pivot_table(
-        index=["country", "year"], columns="hs_code_raw", values="value_usd", aggfunc="first"
+        index=["country", "year"], columns="hs_code_raw",
+        values="value_eur", aggfunc="first"
     ).reset_index()
     wide.columns.name = None
 
-    rename_map = {f"HS17_{code}": f"HS_{code}" for code in HS_CODES}
-    rename_map["_T"] = "total_export"
+    rename_map = {code: f"HS_{code}" for code in HS_CODES}
+    rename_map["TOTAL"] = "total_export"
     wide = wide.rename(columns=rename_map)
 
     hs_cols = [f"HS_{c}" for c in HS_CODES]
@@ -1670,14 +1656,15 @@ def fetch_hs_export_data():
     # share: combined HS export value as a share of total merchandise exports
     wide["share"] = wide[hs_cols].sum(axis=1) / wide["total_export"]
 
-    print(f"  [diagnostic] HS export data: {wide.shape[0]} country-year rows.")
+    print(f"  [diagnostic] HS2022 export data: {wide.shape[0]} country-year "
+          f"rows ({wide['year'].min()}-{wide['year'].max()}).")
     return wide
 
 
 # ----------------------------------------------------------------------
 # 6b. CPA 2.2-classified EU trade data (Comext DS-059366) -- a SEPARATE
 #     source from fetch_hs_export_data() above (which uses HS/CN codes
-#     via OECD BIMTS). This section fetches export values classified by
+#     via Comext DS-059341). This section fetches export values classified by
 #     CPA (Statistical Classification of Products by Activity) instead,
 #     for three specific CPA 2.2 product groups plus the total export
 #     value, split by intra-EU vs. extra-EU trade flow.
@@ -1970,7 +1957,7 @@ def _fetch_world_bank_indicator(indicator_code, value_col_name, countries=COUNTR
 
     HONESTY NOTE: this exact query was not independently live-tested
     against the World Bank API before delivery (unlike this project's
-    OECD BIMTS queries, which went through extensive live trial-and-
+    Eurostat Comext queries, which went through extensive live trial-and-
     error earlier) -- the request/response format below follows the
     World Bank's own official API documentation closely and should
     work, but if it doesn't on first run, paste the printed diagnostic
@@ -2237,7 +2224,7 @@ if __name__ == "__main__":
     print("\n[8/21] STOXX Europe 600 index (Yahoo Finance)...")
     sheets["index_stoxx600"] = fetch_stoxx600_raw()
 
-    print("\n[9/21] AI/ICT-related HS export data (OECD BIMTS)...")
+    print("\n[9/21] AI/ICT-related HS2022 export data (Comext DS-059341)...")
     sheets["hs_export"] = fetch_hs_export_data()
 
     print("\n[10/21] CPA 2.2 EU export data, intra-/extra-EU (Comext DS-059366)...")
@@ -2383,8 +2370,8 @@ if __name__ == "__main__":
                     formula = f"=SUM(C{excel_row}:J{excel_row})/K{excel_row}"
                     # BUGFIX, unchanged from before: a plain Python "+"
                     # between the HS_84xxxx values propagates NaN if ANY
-                    # single one is missing (e.g. BIMTS genuinely has no
-                    # recorded IE/2019/HS_848630 observation) -- unlike
+                    # single one is missing (e.g. a source country-year has
+                    # no recorded value for one selected HS product) -- unlike
                     # Excel's own SUM() function (which treats a blank cell
                     # as 0), and unlike pandas' .sum() (skipna=True by
                     # default, used when "share" was first computed in
