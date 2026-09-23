@@ -6,6 +6,17 @@ from openpyxl.chart.marker import Marker
 from openpyxl.chart.shapes import GraphicalProperties
 from openpyxl.styles import Font, Alignment, PatternFill
 
+
+# ----------------------------------------------------------------------
+# USER OPTION: State Aid control in all regressions
+# ----------------------------------------------------------------------
+# False (default): baseline regressions contain no State Aid control.
+# True: add standardized [State aid expenditure in year t / nominal GDP
+#       in year t-1] to every OLS, probit, and logit regression.
+INCLUDE_STATE_AID_CONTROL = False
+STATE_AID_CONTROL_RAW = "state_aid_over_lagged_gdp"
+STATE_AID_CONTROL_STD = "state_aid_over_lagged_gdp_std"
+
 # --- Load source data ---
 forecast = pd.read_excel("ec_forecast_vs_realized.xlsx")
 ict = pd.read_excel("ai_data.xlsx", sheet_name="ict_inv")[["country", "year", "ict_share"]]
@@ -22,23 +33,28 @@ eur_export = eur_export.rename(columns={"year": "target_year", "share": "eur_exp
 ai_inv = pd.read_excel("ai_data.xlsx", sheet_name="ai_inv")[["country", "year", "share"]]
 ai_inv = ai_inv.rename(columns={"year": "target_year", "share": "ai_inv_share"})
 
-# Contemporaneous State Aid control. Unlike the four focal explanatory
-# variables, support_share uses the SAME year t as growth_surprise. If a
-# country's 2025 value is unavailable, use that country's 2024 value; an
-# observed 2025 value always takes precedence.
-support = pd.read_excel("ai_data.xlsx", sheet_name="support")[[
-    "country", "year", "support_share"
-]].rename(columns={"year": "target_year"})
-support["support_source_year"] = support["target_year"]
-support_2025_fallback = support.loc[
-    support["target_year"].eq(2024)
-    & ~support["country"].isin(
-        support.loc[support["target_year"].eq(2025), "country"])
-].copy()
-support_2025_fallback["target_year"] = 2025
-support_control = pd.concat([support, support_2025_fallback], ignore_index=True)
-support_control = support_control.drop_duplicates(
-    ["country", "target_year"], keep="first")
+if INCLUDE_STATE_AID_CONTROL:
+    support_raw = pd.read_excel("ai_data.xlsx", sheet_name="support")[[
+        "country", "year", "state_aid_m_eur", "gdp_m_eur"
+    ]]
+    aid_t = support_raw[["country", "year", "state_aid_m_eur"]].rename(
+        columns={"year": "target_year"})
+    aid_t["state_aid_source_year"] = aid_t["target_year"]
+    gdp_lag = support_raw[["country", "year", "gdp_m_eur"]].copy()
+    gdp_lag["gdp_source_year"] = gdp_lag["year"]
+    gdp_lag["target_year"] = gdp_lag["year"] + 1
+    gdp_lag = gdp_lag.drop(columns="year").rename(
+        columns={"gdp_m_eur": "gdp_m_eur_lag1"})
+    support_control = aid_t.merge(
+        gdp_lag, on=["country", "target_year"], how="left",
+        validate="one_to_one")
+    support_control[STATE_AID_CONTROL_RAW] = (
+        support_control["state_aid_m_eur"]
+        / support_control["gdp_m_eur_lag1"])
+    support_control = support_control.drop_duplicates(
+        ["country", "target_year"], keep="first")
+else:
+    support_control = None
 
 # National-vs-semiconductor index correlation: rolling 8-QUARTER
 # correlation between each country's national index log-return and the
@@ -84,7 +100,9 @@ merged_ai_inv = forecast.merge(ai_inv_lagged, on=["country", "target_year"], how
 
 
 def add_support_control(df):
-    """Attach same-year support_share (2024 fallback only for missing 2025)."""
+    """Attach optional Aid(t)/GDP(t-1); do nothing in the baseline model."""
+    if not INCLUDE_STATE_AID_CONTROL:
+        return df
     return df.merge(
         support_control,
         on=["country", "target_year"],
@@ -97,6 +115,9 @@ merged_ict = add_support_control(merged_ict)
 merged_eur = add_support_control(merged_eur)
 merged_corr = add_support_control(merged_corr)
 merged_ai_inv = add_support_control(merged_ai_inv)
+print("State Aid regression control: "
+      + ("ON -- standardized Aid(t)/GDP(t-1)"
+         if INCLUDE_STATE_AID_CONTROL else "OFF -- baseline models"))
 print(f"previous-year ict_share merge: {len(merged_ict)} rows (from {len(forecast)} forecast rows)")
 print(f"previous-year eur_export share merge: {len(merged_eur)} rows (from {len(forecast)} forecast rows)")
 print(f"previous-year stock/semis correlation merge: {len(merged_corr)} rows (from {len(forecast)} forecast rows)")
@@ -1383,16 +1404,44 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
 def _standardize(series):
     """
     Z-score standardization (x - mean) / sd, per explicit instruction
-    to include X, AboveMedian, and the support_share control as standardized
-    variables in all regressions -- NOT the dummy/derived variables (shock_year_dummy,
-    interaction terms), which stay in their original 0/1 or product
-    scale. Mean/SD are computed on the series' own non-missing values
-    (skipna, pandas default), so a NaN entry stays NaN after
-    standardizing rather than being silently dropped or zeroed here --
-    each regression's own dropna() still handles missing values
-    exactly as before.
+    to include X and AboveMedian as standardized variables. When the optional
+    State Aid control is enabled, Aid(t)/GDP(t-1) is standardized too. Dummy
+    and interaction terms remain in their original 0/1 or product scale.
     """
     return (series - series.mean()) / series.std()
+
+
+def _prepare_state_aid_control(df):
+    """Standardize the optional control in-place and return its model columns."""
+    if not INCLUDE_STATE_AID_CONTROL:
+        return []
+    df[STATE_AID_CONTROL_STD] = _standardize(df[STATE_AID_CONTROL_RAW])
+    return [STATE_AID_CONTROL_STD]
+
+
+def _state_aid_diagnostic_cols():
+    if not INCLUDE_STATE_AID_CONTROL:
+        return []
+    return [
+        "state_aid_m_eur", "state_aid_source_year",
+        "gdp_m_eur_lag1", "gdp_source_year",
+        STATE_AID_CONTROL_RAW, STATE_AID_CONTROL_STD,
+    ]
+
+
+CONTROL_HEADERS = (
+    ["phi (std Aid(t)/GDP(t-1))", "SE(phi)", "p(phi)"]
+    if INCLUDE_STATE_AID_CONTROL else []
+)
+CONTROL_EQUATION_TERM = (
+    " + phi*std[Aid(t)/GDP(t-1)]" if INCLUDE_STATE_AID_CONTROL else ""
+)
+CONTROL_SETTING_NOTE = (
+    "State Aid control ON: standardized Aid(t)/GDP(t-1); observations without "
+    "both inputs are excluded."
+    if INCLUDE_STATE_AID_CONTROL
+    else "State Aid control OFF: these are the baseline regressions without that control."
+)
 
 
 def _clean_var_label(label):
@@ -1479,7 +1528,7 @@ def write_regression_data_block(regression_number, label, df_src, x_col, extra_c
 
 
 ws_data_regr.column_dimensions["A"].width = 45
-for col_letter in "BCDEFGHIJKL":
+for col_letter in "BCDEFGHIJKLMNO":
     ws_data_regr.column_dimensions[col_letter].width = 16
 chart_data_row = 30  # fixed early start row -- charts now come FIRST
 
@@ -1861,13 +1910,12 @@ ws_summary.cell(
           "further below, and the 'share positive surprises' blocks above, "
           "test instead). Every X is aligned strictly at t-1 relative to the "
           "outcome year t; observations without that prior-year value are excluded. "
-          "The standardized State Aid control is contemporaneous at t (using the "
-          "country's 2024 value only when its 2025 value is missing)."
+          + CONTROL_SETTING_NOTE
 ).font = Font(italic=True, size=9, color="800000")
 reg_start_row += 2
 ws_summary.cell(row=reg_start_row, column=1,
     value="Panel regressions: growth_surprise(t) = const + country FE + "
-                       "time FE + beta*X(t-1) + phi*support_share_std(t)").font = Font(
+                       "time FE + beta*X(t-1)" + CONTROL_EQUATION_TERM).font = Font(
     bold=True, size=12)
 ws_summary.cell(
     row=reg_start_row + 1, column=1,
@@ -1876,9 +1924,9 @@ ws_summary.cell(
 ).font = Font(italic=True, size=9)
 
 reg_header_row = reg_start_row + 3
-reg_headers = ["Explanatory variable", "beta", "SE", "t-stat", "p-value",
-               "phi (std support_share)", "SE(phi)", "p(phi)",
-               "R-squared", "N (obs)", "N (countries)", "N (years)"]
+reg_headers = (["Explanatory variable", "beta", "SE", "t-stat", "p-value"]
+               + CONTROL_HEADERS
+               + ["R-squared", "N (obs)", "N (countries)", "N (years)"])
 for col_idx, h in enumerate(reg_headers, start=1):
     ws_summary.cell(row=reg_header_row, column=col_idx, value=h).font = bold
 
@@ -1892,14 +1940,14 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     # via extra_cols below) in the data_regr sheet for verification.
     x_col_std = x_col + "_std"
     df_src[x_col_std] = _standardize(df_src[x_col])
-    df_src["support_share_std"] = _standardize(df_src["support_share"])
+    control_cols = _prepare_state_aid_control(df_src)
     result = panel_ols_two_way_fe(
-        df_src, "growth_surprise", x_col_std, extra_cols=["support_share_std"])
-    phi = result["extra"]["support_share_std"]
+        df_src, "growth_surprise", x_col_std, extra_cols=control_cols)
+    phi = (result["extra"][STATE_AID_CONTROL_STD]
+           if INCLUDE_STATE_AID_CONTROL else None)
     write_regression_data_block(
         1, label, df_src, x_col_std,
-        extra_cols=[x_col, "support_share", "support_share_std",
-                    "support_source_year"])
+        extra_cols=[x_col] + _state_aid_diagnostic_cols())
 
     row_idx = reg_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -1907,13 +1955,16 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
     ws_summary.cell(row=row_idx, column=4, value=round(result["t_stat"], 3))
     ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=6, value=round(phi["beta"], 4))
-    ws_summary.cell(row=row_idx, column=7, value=round(phi["se"], 4))
-    ws_summary.cell(row=row_idx, column=8, value=round(phi["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=9, value=round(result["r_squared"], 4))
-    ws_summary.cell(row=row_idx, column=10, value=result["n_obs"])
-    ws_summary.cell(row=row_idx, column=11, value=result["n_entities"])
-    ws_summary.cell(row=row_idx, column=12, value=result["n_periods"])
+    next_col = 6
+    if INCLUDE_STATE_AID_CONTROL:
+        ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+        ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+        ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+        next_col += 3
+    ws_summary.cell(row=row_idx, column=next_col, value=round(result["r_squared"], 4))
+    ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
+    ws_summary.cell(row=row_idx, column=next_col + 2, value=result["n_entities"])
+    ws_summary.cell(row=row_idx, column=next_col + 3, value=result["n_periods"])
     print(f"  Panel regression ({label}): beta={result['beta']:.4f}, "
           f"p={result['p_value']:.4f}, N={result['n_obs']}")
     summary_table_results.setdefault(_clean_var_label(label), {})[4] = (result["beta"], result["p_value"])
@@ -1956,8 +2007,8 @@ reg2_start_row = reg_header_row + len(regression_specs) + 3
 ws_summary.cell(
     row=reg2_start_row, column=1,
     value="Panel regressions WITH SHOCK-YEAR INTERACTION: growth_surprise = const + "
-          "country FE + time FE + beta*X + gamma*(X*shock_year_dummy) + "
-          "phi*support_share_std(t)"
+          "country FE + time FE + beta*X + gamma*(X*shock_year_dummy)"
+          + CONTROL_EQUATION_TERM
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg2_start_row + 1, column=1,
@@ -1967,10 +2018,9 @@ ws_summary.cell(
 ).font = Font(italic=True, size=9)
 
 reg2_header_row = reg2_start_row + 3
-reg2_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
-                "gamma (X*shock)", "SE(gamma)", "p(gamma)",
-                "phi (std support_share)", "SE(phi)", "p(phi)",
-                "R-squared", "N (obs)"]
+reg2_headers = (["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
+                 "gamma (X*shock)", "SE(gamma)", "p(gamma)"]
+                + CONTROL_HEADERS + ["R-squared", "N (obs)"])
 for col_idx, h in enumerate(reg2_headers, start=1):
     ws_summary.cell(row=reg2_header_row, column=col_idx, value=h).font = bold
 
@@ -1987,16 +2037,16 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     df_src[x_col_std] = _standardize(df_src[x_col])
     df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
     df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-    df_src["support_share_std"] = _standardize(df_src["support_share"])
+    control_cols = _prepare_state_aid_control(df_src)
     result = panel_ols_two_way_fe(
         df_src, "growth_surprise", x_col_std,
-        extra_cols=["interaction", "support_share_std"])
+        extra_cols=["interaction"] + control_cols)
     gamma = result["extra"]["interaction"]
-    phi = result["extra"]["support_share_std"]
+    phi = (result["extra"][STATE_AID_CONTROL_STD]
+           if INCLUDE_STATE_AID_CONTROL else None)
     write_regression_data_block(2, label, df_src, x_col_std,
                                  extra_cols=[x_col, "shock_year_dummy", "interaction",
-                                             "support_share", "support_share_std",
-                                             "support_source_year"])
+                                             ] + _state_aid_diagnostic_cols())
 
     row_idx = reg2_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2006,11 +2056,14 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
     ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
     ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
-    ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
-    ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=11, value=round(result["r_squared"], 4))
-    ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
+    next_col = 8
+    if INCLUDE_STATE_AID_CONTROL:
+        ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+        ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+        ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+        next_col += 3
+    ws_summary.cell(row=row_idx, column=next_col, value=round(result["r_squared"], 4))
+    ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
     print(f"  Interaction regression ({label}): beta={result['beta']:.4f} "
           f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} (p={gamma['p_value']:.4f}), "
           f"N={result['n_obs']}")
@@ -2040,7 +2093,7 @@ ws_summary.cell(
     row=reg3_start_row, column=1,
     value="Panel regressions WITH ABOVE-MEDIAN VARIABLE AND SHOCK-YEAR INTERACTION: "
           "growth_surprise = const + country FE + time FE + beta*AboveMedian + "
-          "gamma*(AboveMedian*shock_year_dummy) + phi*support_share_std(t)"
+          "gamma*(AboveMedian*shock_year_dummy)" + CONTROL_EQUATION_TERM
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg3_start_row + 1, column=1,
@@ -2054,10 +2107,9 @@ ws_summary.cell(
 ).font = Font(italic=True, size=9)
 
 reg3_header_row = reg3_start_row + 3
-reg3_headers = ["Explanatory variable", "beta (AboveMedian)", "SE(beta)", "p(beta)",
-                "gamma (AboveMedian*shock)", "SE(gamma)", "p(gamma)",
-                "phi (std support_share)", "SE(phi)", "p(phi)",
-                "R-squared", "N (obs)"]
+reg3_headers = (["Explanatory variable", "beta (AboveMedian)", "SE(beta)", "p(beta)",
+                 "gamma (AboveMedian*shock)", "SE(gamma)", "p(gamma)"]
+                + CONTROL_HEADERS + ["R-squared", "N (obs)"])
 for col_idx, h in enumerate(reg3_headers, start=1):
     ws_summary.cell(row=reg3_header_row, column=col_idx, value=h).font = bold
 
@@ -2107,17 +2159,17 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     df_src["above_median"] = _standardize(df_src["above_median_raw"])
     df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
     df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-    df_src["support_share_std"] = _standardize(df_src["support_share"])
+    control_cols = _prepare_state_aid_control(df_src)
     result = panel_ols_two_way_fe(
         df_src, "growth_surprise", "above_median",
-        extra_cols=["above_x_shock", "support_share_std"])
+        extra_cols=["above_x_shock"] + control_cols)
     gamma = result["extra"]["above_x_shock"]
-    phi = result["extra"]["support_share_std"]
+    phi = (result["extra"][STATE_AID_CONTROL_STD]
+           if INCLUDE_STATE_AID_CONTROL else None)
     write_regression_data_block(3, label, df_src, "above_median",
                                  extra_cols=[x_col, "above_median_raw",
                                              "shock_year_dummy", "above_x_shock",
-                                             "support_share", "support_share_std",
-                                             "support_source_year"])
+                                             ] + _state_aid_diagnostic_cols())
 
     row_idx = reg3_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2127,11 +2179,14 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
     ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
     ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
-    ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
-    ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
-    ws_summary.cell(row=row_idx, column=11, value=round(result["r_squared"], 4))
-    ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
+    next_col = 8
+    if INCLUDE_STATE_AID_CONTROL:
+        ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+        ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+        ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+        next_col += 3
+    ws_summary.cell(row=row_idx, column=next_col, value=round(result["r_squared"], 4))
+    ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
     print(f"  Above-median interaction regression ({label}): beta={result['beta']:.4f} "
           f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} (p={gamma['p_value']:.4f}), "
           f"N={result['n_obs']}, median={median_val:.4f}")
@@ -2151,7 +2206,7 @@ ws_summary.cell(
     row=probit_primary_start_row, column=1,
     value="PROBIT versions of the three panel regressions above: "
           "P(growth_surprise > 0) = Phi(const + country FE + time FE + beta*X "
-          "[+ gamma*interaction] + phi*support_share_std(t))"
+          "[+ gamma*interaction]" + CONTROL_EQUATION_TERM + ")"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=probit_primary_start_row + 1, column=1,
@@ -2175,14 +2230,14 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
         bold=True, size=10, italic=True)
     probit_primary_header_row = probit_primary_current_row + 1
     if interaction_col_name is None:
-        probit_primary_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)",
-                          "p(beta)", "phi (std support_share)", "SE(phi)", "p(phi)",
-                          "Pseudo R-sq", "N (obs)"]
+        probit_primary_headers = (
+            ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)", "p(beta)"]
+            + CONTROL_HEADERS + ["Pseudo R-sq", "N (obs)"])
     else:
-        probit_primary_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
-                          f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)",
-                          "phi (std support_share)", "SE(phi)", "p(phi)",
-                          "Pseudo R-sq", "N (obs)"]
+        probit_primary_headers = (
+            ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
+             f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)"]
+            + CONTROL_HEADERS + ["Pseudo R-sq", "N (obs)"])
     for col_idx, h in enumerate(probit_primary_headers, start=1):
         ws_summary.cell(row=probit_primary_header_row, column=col_idx, value=h).font = bold
 
@@ -2195,21 +2250,25 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
         if interaction_col_name is None:
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
-            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            control_cols = _prepare_state_aid_control(df_src)
             result = panel_probit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
-                extra_cols=["support_share_std"])
-            phi = result["extra"]["support_share_std"]
+                extra_cols=control_cols)
+            phi = (result["extra"][STATE_AID_CONTROL_STD]
+                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=6, value=round(phi["beta"], 4))
-            ws_summary.cell(row=row_idx, column=7, value=round(phi["se"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(phi["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=10, value=result["n_obs"])
+            next_col = 6
+            if INCLUDE_STATE_AID_CONTROL:
+                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+                next_col += 3
+            ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), N={result['n_obs']}")
             summary_table_results.setdefault(_clean_var_label(label), {})[1] = (
@@ -2219,12 +2278,13 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            control_cols = _prepare_state_aid_control(df_src)
             result = panel_probit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
-                extra_cols=["interaction", "support_share_std"])
+                extra_cols=["interaction"] + control_cols)
             gamma = result["extra"]["interaction"]
-            phi = result["extra"]["support_share_std"]
+            phi = (result["extra"][STATE_AID_CONTROL_STD]
+                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2232,11 +2292,14 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
-            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
+            next_col = 8
+            if INCLUDE_STATE_AID_CONTROL:
+                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+                next_col += 3
+            ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}")
@@ -2254,12 +2317,13 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src["above_median"] = _standardize(df_src["above_median_raw"])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            control_cols = _prepare_state_aid_control(df_src)
             result = panel_probit_two_way_fe(
                 df_src, "growth_surprise", "above_median",
-                extra_cols=["above_x_shock", "support_share_std"])
+                extra_cols=["above_x_shock"] + control_cols)
             gamma = result["extra"]["above_x_shock"]
-            phi = result["extra"]["support_share_std"]
+            phi = (result["extra"][STATE_AID_CONTROL_STD]
+                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2267,11 +2331,14 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
-            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
+            next_col = 8
+            if INCLUDE_STATE_AID_CONTROL:
+                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+                next_col += 3
+            ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}, median={median_val:.4f}")
@@ -2374,8 +2441,8 @@ note_lines = [
     "Note: Coefficient shown is beta for models (1) and (4) (the plain-X "
     "specification), and gamma (the interaction-term coefficient) for models "
     "(2), (3), (5), and (6). Significance: * p<0.10, ** p<0.05, *** p<0.01.",
-    "(4) OLS, plain X: growth_surprise = const + country FE + time FE + beta*X "
-    "+ phi*support_share_std.",
+    "(4) OLS, plain X: growth_surprise = const + country FE + time FE + beta*X"
+    + CONTROL_EQUATION_TERM + ".",
     "(5) OLS, X + shock-year interaction: adds gamma*(X*shock_year_dummy) to (4); "
     "gamma is the ADDITIONAL effect of X specifically during shock years.",
     # Split across two lines, same reasoning/layout as (1) below: this
@@ -2406,8 +2473,7 @@ note_lines = [
     "chart, test, and regression.",
     "     AboveMedian_raw is constructed from that same t-1 explanatory value, and "
     "shock interactions multiply the lagged exposure by the outcome-year shock dummy; "
-    "support_share is contemporaneous at t (2024 if 2025 is missing), standardized, "
-    "and its phi is omitted only from the compact Regression results table.",
+    + CONTROL_SETTING_NOTE + " Phi is never included in the compact Regression results table.",
     # Explanatory note on standardization, per explicit instruction --
     # split across several lines, same wrapping reasoning as the notes
     # above.
@@ -2418,8 +2484,8 @@ note_lines = [
     "shock_year_dummy and the interaction terms themselves (X*shock_year_dummy, "
     "AboveMedian*shock_year_dummy) are NOT separately standardized, since they are",
     "     dummy/product terms, not the continuous explanatory variables the "
-    "standardization was requested for; support_share is also standardized before entry, "
-    "with phi, SE(phi), and p(phi) reported in the detailed tables.",
+    "standardization was requested for. When enabled, Aid(t)/GDP(t-1) is standardized, "
+    "with phi, SE(phi), and p(phi) reported only in the detailed tables.",
     "For OLS (models 4-6): this means beta is directly interpretable as \"a "
     "one-standard-deviation increase in X is associated with a beta-unit change in "
     "growth_surprise (in its own original units), holding other variables constant.\"",
@@ -2485,14 +2551,14 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
         bold=True, size=10, italic=True)
     logit_robustness_header_row = logit_robustness_current_row + 1
     if interaction_col_name is None:
-        logit_robustness_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)",
-                           "p(beta)", "phi (std support_share)", "SE(phi)", "p(phi)",
-                           "Pseudo R-sq", "N (obs)"]
+        logit_robustness_headers = (
+            ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)", "p(beta)"]
+            + CONTROL_HEADERS + ["Pseudo R-sq", "N (obs)"])
     else:
-        logit_robustness_headers = ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
-                           f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)",
-                           "phi (std support_share)", "SE(phi)", "p(phi)",
-                           "Pseudo R-sq", "N (obs)"]
+        logit_robustness_headers = (
+            ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
+             f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)"]
+            + CONTROL_HEADERS + ["Pseudo R-sq", "N (obs)"])
     for col_idx, h in enumerate(logit_robustness_headers, start=1):
         ws_summary.cell(row=logit_robustness_header_row, column=col_idx, value=h).font = bold
 
@@ -2505,21 +2571,25 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
         if interaction_col_name is None:
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
-            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            control_cols = _prepare_state_aid_control(df_src)
             result = panel_logit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
-                extra_cols=["support_share_std"])
-            phi = result["extra"]["support_share_std"]
+                extra_cols=control_cols)
+            phi = (result["extra"][STATE_AID_CONTROL_STD]
+                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=6, value=round(phi["beta"], 4))
-            ws_summary.cell(row=row_idx, column=7, value=round(phi["se"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(phi["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=10, value=result["n_obs"])
+            next_col = 6
+            if INCLUDE_STATE_AID_CONTROL:
+                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+                next_col += 3
+            ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), N={result['n_obs']}")
         elif interaction_col_name == "interaction":
@@ -2527,12 +2597,13 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            control_cols = _prepare_state_aid_control(df_src)
             result = panel_logit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
-                extra_cols=["interaction", "support_share_std"])
+                extra_cols=["interaction"] + control_cols)
             gamma = result["extra"]["interaction"]
-            phi = result["extra"]["support_share_std"]
+            phi = (result["extra"][STATE_AID_CONTROL_STD]
+                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2540,11 +2611,14 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
-            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
+            next_col = 8
+            if INCLUDE_STATE_AID_CONTROL:
+                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+                next_col += 3
+            ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}")
@@ -2556,12 +2630,13 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             df_src["above_median"] = _standardize(df_src["above_median_raw"])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-            df_src["support_share_std"] = _standardize(df_src["support_share"])
+            control_cols = _prepare_state_aid_control(df_src)
             result = panel_logit_two_way_fe(
                 df_src, "growth_surprise", "above_median",
-                extra_cols=["above_x_shock", "support_share_std"])
+                extra_cols=["above_x_shock"] + control_cols)
             gamma = result["extra"]["above_x_shock"]
-            phi = result["extra"]["support_share_std"]
+            phi = (result["extra"][STATE_AID_CONTROL_STD]
+                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2569,11 +2644,14 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=8, value=round(phi["beta"], 4))
-            ws_summary.cell(row=row_idx, column=9, value=round(phi["se"], 4))
-            ws_summary.cell(row=row_idx, column=10, value=round(phi["p_value"], 4))
-            ws_summary.cell(row=row_idx, column=11, value=round(result["pseudo_r2"], 4))
-            ws_summary.cell(row=row_idx, column=12, value=result["n_obs"])
+            next_col = 8
+            if INCLUDE_STATE_AID_CONTROL:
+                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
+                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
+                next_col += 3
+            ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
+            ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}, median={median_val:.4f}")
