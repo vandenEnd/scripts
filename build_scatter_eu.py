@@ -13,7 +13,7 @@ from openpyxl.styles import Font, Alignment, PatternFill
 # False (default): baseline regressions contain no State Aid control.
 # True: add standardized [State aid expenditure in year t / nominal GDP
 #       in year t-1] to every OLS, probit, and logit regression.
-INCLUDE_STATE_AID_CONTROL = False
+INCLUDE_STATE_AID_CONTROL = True
 STATE_AID_CONTROL_RAW = "state_aid_over_lagged_gdp"
 STATE_AID_CONTROL_STD = "state_aid_over_lagged_gdp_std"
 
@@ -387,33 +387,10 @@ for col_idx in range(2, 2 + len(period_labels_ordered)):
     ws_summary.column_dimensions[chr(64 + col_idx)].width = 16
 
 
-def significance_stars(x1, n1, x2, n2, symbol="*"):
-    """
-    Two-proportion z-test (pooled variance) between two independent
-    "share positive" proportions (p1=x1/n1, p2=x2/n2) -- used to test
-    whether two "share positive surprises" cells genuinely differ, not
-    just numerically but statistically. Returns symbol/symbol*2/
-    symbol*3 for p<0.10/0.05/0.01 respectively, "" if not significant
-    or if either n is 0 (comparison undefined, matching this project's
-    existing "n/a" handling for zero-count cells elsewhere).
-
-    symbol: "*" (default) for the WITHIN-period below-vs-above
-    comparisons (D/H columns); "+" for the ACROSS-period (all years
-    vs. shock years) comparisons (F/G/H columns) -- two different
-    symbols so a cell needing BOTH (H, which is both an above-vs-below
-    AND an across-period comparison site) can show both distinctly
-    combined, e.g. "above +++ **", rather than an ambiguous "*****".
-    """
-    from scipy import stats as _stats
-    if n1 == 0 or n2 == 0:
+def _marker_from_p_value(p_value, symbol="*"):
+    """Map a valid two-sided p-value to the workbook's marker convention."""
+    if p_value is None or not np.isfinite(p_value):
         return ""
-    p1, p2 = x1 / n1, x2 / n2
-    p_pool = (x1 + x2) / (n1 + n2)
-    denom = p_pool * (1 - p_pool) * (1 / n1 + 1 / n2)
-    if denom <= 0:
-        return ""
-    z = (p1 - p2) / (denom ** 0.5)
-    p_value = 2 * (1 - _stats.norm.cdf(abs(z)))
     if p_value < 0.01:
         return symbol * 3
     if p_value < 0.05:
@@ -421,6 +398,91 @@ def significance_stars(x1, n1, x2, n2, symbol="*"):
     if p_value < 0.10:
         return symbol
     return ""
+
+
+def country_clustered_share_test(sample1, sample2, symbol="*"):
+    """Test a difference between two shares with clustering by country.
+
+    Each sample must contain ``country`` and binary ``success`` columns.
+    The samples are stacked and the difference is estimated as the slope
+    in a linear-probability model with a sample indicator. Country-level
+    score sums form the sandwich meat. The covariance uses the same CR1
+    finite-sample correction as the regressions in this script, and the
+    two-sided test uses G-1 country-cluster degrees of freedom.
+
+    Stacking deliberately permits an observation to occur in both samples.
+    This handles shock-years versus all-years comparisons, where shock years
+    are part of the all-years sample, without treating the two percentages as
+    independent.
+    """
+    from scipy import stats as _stats
+
+    required = {"country", "success"}
+    if not required.issubset(sample1.columns) or not required.issubset(sample2.columns):
+        raise ValueError("Share-test samples must contain country and success columns.")
+
+    s1 = sample1.loc[:, ["country", "success"]].dropna().copy()
+    s2 = sample2.loc[:, ["country", "success"]].dropna().copy()
+    if s1.empty or s2.empty:
+        return {"difference": np.nan, "se": np.nan, "t_stat": np.nan,
+                "p_value": np.nan, "n_clusters": 0, "marker": ""}
+
+    s1["comparison_group"] = 1.0
+    s2["comparison_group"] = 0.0
+    stacked = pd.concat([s1, s2], ignore_index=True)
+    stacked["success"] = stacked["success"].astype(float)
+
+    y = stacked["success"].to_numpy()
+    group = stacked["comparison_group"].to_numpy()
+    X = np.column_stack([np.ones(len(stacked)), group])
+    if np.linalg.matrix_rank(X) < X.shape[1]:
+        return {"difference": np.nan, "se": np.nan, "t_stat": np.nan,
+                "p_value": np.nan, "n_clusters": 0, "marker": ""}
+
+    bread = np.linalg.inv(X.T @ X)
+    beta = bread @ X.T @ y
+    residual = y - X @ beta
+    score_obs = X * residual[:, None]
+    cluster_labels = stacked["country"].astype(str).to_numpy()
+    clusters = pd.unique(cluster_labels)
+    n_clusters = len(clusters)
+    n_obs, n_params = X.shape
+    if n_clusters < 2 or n_obs <= n_params:
+        return {"difference": float(beta[1]), "se": np.nan, "t_stat": np.nan,
+                "p_value": np.nan, "n_clusters": n_clusters, "marker": ""}
+
+    cluster_scores = np.vstack([
+        score_obs[cluster_labels == cluster].sum(axis=0)
+        for cluster in clusters
+    ])
+    meat = cluster_scores.T @ cluster_scores
+    correction = ((n_clusters / (n_clusters - 1))
+                  * ((n_obs - 1) / (n_obs - n_params)))
+    covariance = correction * (bread @ meat @ bread)
+    se = float(np.sqrt(max(covariance[1, 1], 0.0)))
+    difference = float(beta[1])
+    if se == 0:
+        p_value = 1.0 if difference == 0 else 0.0
+        t_stat = 0.0 if difference == 0 else np.sign(difference) * np.inf
+    else:
+        t_stat = difference / se
+        p_value = float(2 * _stats.t.sf(abs(t_stat), df=n_clusters - 1))
+
+    return {
+        "difference": difference,
+        "se": se,
+        "t_stat": float(t_stat),
+        "p_value": p_value,
+        "n_clusters": n_clusters,
+        "marker": _marker_from_p_value(p_value, symbol=symbol),
+    }
+
+
+def _share_observations(df):
+    """Return country identifiers and a positive-surprise indicator."""
+    d = df.loc[df["growth_surprise"].notna(), ["country", "growth_surprise"]].copy()
+    d["success"] = (d["growth_surprise"] > 0).astype(float)
+    return d[["country", "success"]]
 
 
 def write_summary_block(ws_summary, next_row, source_sheet_name, data_sheet_title,
@@ -591,6 +653,9 @@ def write_clustered_time_chart(wb, cluster_key, merged_df, cluster_col, cluster_
         "n_full": len(full_gs), "x_full": int((full_gs > 0).sum()),
         "n_below": len(below_gs), "x_below": int((below_gs > 0).sum()),
         "n_above": len(above_gs), "x_above": int((above_gs > 0).sum()),
+        "obs_full": _share_observations(df_sorted),
+        "obs_below": _share_observations(df_sorted.iloc[:n_below]),
+        "obs_above": _share_observations(df_sorted.iloc[n_below:]),
     }
 
     # Summary block now written into the SHARED "summary" sheet (not
@@ -761,6 +826,9 @@ def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, h
         "n_full": len(full_gs), "x_full": int((full_gs > 0).sum()),
         "n_below": len(below_gs), "x_below": int((below_gs > 0).sum()),
         "n_above": len(above_gs), "x_above": int((above_gs > 0).sum()),
+        "obs_full": _share_observations(df_sorted),
+        "obs_below": _share_observations(df_sorted.iloc[:n_below]),
+        "obs_above": _share_observations(df_sorted.iloc[n_below:]),
     }
 
     # Summary block now written into the SHARED "summary" sheet (not
@@ -790,31 +858,6 @@ group_header_row = summary_row + 1
 ws_summary.cell(row=group_header_row, column=2, value="All years").font = Font(bold=True, size=12)
 ws_summary.cell(row=group_header_row, column=6, value="Shock years").font = Font(bold=True, size=12)
 summary_row = group_header_row + 2
-def build_significance_formula(range1, range2, symbol="*"):
-    """
-    Builds a LIVE Excel formula that reproduces significance_stars()'s
-    two-proportion z-test entirely in worksheet formulas (COUNTIF/
-    COUNT/NORM.S.DIST), for the requested J12:J27 verification column.
-    range1/range2: Excel range strings (e.g.
-    "'data_cluster_ict_share'!$G$2:$G$245") for the two groups being
-    compared. symbol: "*" or "+", matching significance_stars()'s own
-    convention. Wrapped in IFERROR(...,"") for the same zero-count
-    edge case significance_stars() itself guards against (COUNT=0).
-    """
-    x1 = f'COUNTIF({range1},">0")'
-    n1 = f'COUNT({range1})'
-    x2 = f'COUNTIF({range2},">0")'
-    n2 = f'COUNT({range2})'
-    p1 = f'({x1}/{n1})'
-    p2 = f'({x2}/{n2})'
-    p_pool = f'(({x1}+{x2})/({n1}+{n2}))'
-    denom = f'({p_pool}*(1-{p_pool})*(1/{n1}+1/{n2}))'
-    z = f'(({p1}-{p2})/SQRT({denom}))'
-    p_value = f'(2*(1-_xlfn.NORM.S.DIST(ABS({z}),TRUE)))'
-    stars3, stars2, stars1 = symbol * 3, symbol * 2, symbol
-    mapped = (f'IF({p_value}<0.01,"{stars3}",IF({p_value}<0.05,"{stars2}",'
-              f'IF({p_value}<0.1,"{stars1}","")))')
-    return f'=IFERROR({mapped},"")'
 
 
 # --- Each variable's "cluster" (full-sample, below/above median) block
@@ -847,29 +890,24 @@ def add_significance_stars(ws_summary, header_row, cluster_props, yrs_props):
     the within-period test), rather than overwriting one with the
     other.
     """
-    # Within-period (below vs above), symbol="*"
-    d_star = significance_stars(cluster_props["x_above"], cluster_props["n_above"],
-                                 cluster_props["x_below"], cluster_props["n_below"],
-                                 symbol="*")
-    h_star = significance_stars(yrs_props["x_above"], yrs_props["n_above"],
-                                 yrs_props["x_below"], yrs_props["n_below"],
-                                 symbol="*")
-    # Across-period (shock years vs all years), symbol="+"
-    f_plus = significance_stars(yrs_props["x_full"], yrs_props["n_full"],
-                                 cluster_props["x_full"], cluster_props["n_full"],
-                                 symbol="+")
-    g_plus = significance_stars(yrs_props["x_below"], yrs_props["n_below"],
-                                 cluster_props["x_below"], cluster_props["n_below"],
-                                 symbol="+")
-    h_plus = significance_stars(yrs_props["x_above"], yrs_props["n_above"],
-                                 cluster_props["x_above"], cluster_props["n_above"],
-                                 symbol="+")
+    tests = {
+        "D_within": country_clustered_share_test(
+            cluster_props["obs_above"], cluster_props["obs_below"], symbol="*"),
+        "H_within": country_clustered_share_test(
+            yrs_props["obs_above"], yrs_props["obs_below"], symbol="*"),
+        "F_across": country_clustered_share_test(
+            yrs_props["obs_full"], cluster_props["obs_full"], symbol="+"),
+        "G_across": country_clustered_share_test(
+            yrs_props["obs_below"], cluster_props["obs_below"], symbol="+"),
+        "H_across": country_clustered_share_test(
+            yrs_props["obs_above"], cluster_props["obs_above"], symbol="+"),
+    }
 
     combined = {
-        "D": [d_star],
-        "F": [f_plus],
-        "G": [g_plus],
-        "H": [h_plus, h_star],  # both kinds can apply to H
+        "D": [tests["D_within"]["marker"]],
+        "F": [tests["F_across"]["marker"]],
+        "G": [tests["G_across"]["marker"]],
+        "H": [tests["H_across"]["marker"], tests["H_within"]["marker"]],
     }
     for col_letter, markers in combined.items():
         markers = [m for m in markers if m]
@@ -877,6 +915,7 @@ def add_significance_stars(ws_summary, header_row, cluster_props, yrs_props):
             continue
         cell = ws_summary[f"{col_letter}{header_row}"]
         cell.value = f"{cell.value} {' '.join(markers)}"
+    return tests
 
 
 all_props = {}  # var_label -> (cluster_props, yrs_props), used later for the
@@ -886,6 +925,7 @@ all_props = {}  # var_label -> (cluster_props, yrs_props), used later for the
 block_header_rows = {}  # var_label -> its summary block's header row (12/16/20/24),
                          # used later to build live-formula references from the
                          # staging table (rows 61-67) back to these blocks.
+all_share_tests = {}  # var_label -> country-clustered comparison results
 
 header_row = summary_row + 1
 summary_row, cluster_props = write_clustered_time_chart(
@@ -894,7 +934,8 @@ summary_row, cluster_props = write_clustered_time_chart(
 _, yrs_props, yrs_df_ict = write_special_years_chart(
     wb, "ict_share", forecast, ict, "ict_share", "Previous-year ICT investment share", "FF7F0E",
     ws_summary, header_row - 1, col_offset=4)
-add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
+all_share_tests["Previous-year ICT investment share"] = add_significance_stars(
+    ws_summary, header_row, cluster_props, yrs_props)
 block_header_rows["Previous-year ICT investment share"] = header_row
 all_props["Previous-year ICT investment share"] = (cluster_props, yrs_props)
 
@@ -906,7 +947,8 @@ _, yrs_props, yrs_df_hs = write_special_years_chart(
     wb, "eur_export_share", forecast, eur_export, "eur_export_share",
     "Previous-year AI/ICT-related EU export share", "9467BD",
     ws_summary, header_row - 1, col_offset=4)
-add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
+all_share_tests["Previous-year AI/ICT-related EU export share"] = add_significance_stars(
+    ws_summary, header_row, cluster_props, yrs_props)
 all_props["Previous-year AI/ICT-related EU export share"] = (cluster_props, yrs_props)
 block_header_rows["Previous-year AI/ICT-related EU export share"] = header_row
 
@@ -919,7 +961,8 @@ _, yrs_props, yrs_df_corr = write_special_years_chart(
     wb, "stock_corr", forecast, stock_corr_annual, "stock_semis_corr_annual",
     "Previous-year national vs. semiconductor index correlation", "8C564B",
     ws_summary, header_row - 1, col_offset=4)
-add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
+all_share_tests["Previous-year national vs. semiconductor index correlation"] = (
+    add_significance_stars(ws_summary, header_row, cluster_props, yrs_props))
 all_props["Previous-year national vs. semiconductor index correlation"] = (cluster_props, yrs_props)
 block_header_rows["Previous-year national vs. semiconductor index correlation"] = header_row
 
@@ -933,7 +976,8 @@ _, yrs_props, _ = write_special_years_chart(
     wb, "ai_inv_share", forecast, ai_inv, "ai_inv_share",
     "Previous-year AI incoming investment share (per avg. quarterly GDP)", "17BECF",
     ws_summary, header_row - 1, col_offset=4)
-add_significance_stars(ws_summary, header_row, cluster_props, yrs_props)
+all_share_tests["Previous-year AI incoming investment share"] = add_significance_stars(
+    ws_summary, header_row, cluster_props, yrs_props)
 all_props["Previous-year AI incoming investment share"] = (cluster_props, yrs_props)
 block_header_rows["Previous-year AI incoming investment share"] = header_row
 
@@ -942,72 +986,57 @@ block_header_rows["Previous-year AI incoming investment share"] = header_row
 ws_summary.cell(
     row=28, column=1,
     value="Significance legend: */**/*** = below vs. above median differs at "
-          "10%/5%/1% (two-proportion z-test, within the SAME period -- compare "
-          "D and H columns to C and G). +/++/+++ = shock years differs from "
-          "all years at 10%/5%/1% (SAME column compared ACROSS periods -- "
-          "compare F, G, and H columns to B, C, D; a cell can show both kinds "
-          "combined, e.g. \"above +++ **\", if both tests are significant)."
+          "10%/5%/1% (country-clustered difference-in-shares test, within the "
+          "SAME period -- compare D and H columns to C and G). +/++/+++ = shock "
+          "years differs from all years at 10%/5%/1% (country-clustered test of "
+          "the SAME column ACROSS periods -- compare F, G, and H columns to B, "
+          "C, D). All tests use the CR1 finite-sample correction and t-tests "
+          "with country-cluster degrees of freedom. A cell can show both kinds "
+          "combined, e.g. \"above +++ **\", if both tests are significant."
 ).font = Font(italic=True, size=9)
 
-# --- J12:J27: LIVE Excel formulas reproducing the significance
-# markers (stars/plusses) from scratch, using COUNTIF/COUNT/
-# NORM.S.DIST directly on the underlying data sheets -- so the D/F/G/H
-# markers above can be checked/verified independently. 4 rows per
-# variable block (12-15 ICT, 16-19 Export, 20-23 stock_corr, 24-27
-# ai_inv), one formula type per row within each block:
+# --- J12:J27: audit display of the country-clustered p-values and
+# markers used in D/F/G/H. These are Python-computed plain values because
+# native Excel formulas do not provide the required country-clustered
+# sandwich covariance estimator. Four rows per variable block:
 #   row+0 (header row):  D-type -- above vs below, all years
 #   row+1 (data row):    F-type -- full vs full, shock vs all years
 #   row+2 (NL row):      G-type -- below vs below, shock vs all years
-#   row+3 (blank row):   H-type -- above vs above, shock vs all years
-# Data-sheet names/row ranges are reconstructed from n_below/n_above
-# (each sheet's rows are sorted contiguously: below rows first, then
-# above rows, starting at row 2 -- exactly matching how
-# write_clustered_time_chart()/write_special_years_chart() built them).
+#   row+3 (blank row):   both H-type tests -- across periods and within shocks
 j_col_specs = [
-    ("Previous-year ICT investment share", "data_cluster_ict_share", "data_ict_share_yrs"),
-    ("Previous-year AI/ICT-related EU export share", "data_cluster_eur_export", "data_eur_export_share_yrs"),
-    ("Previous-year national vs. semiconductor index correlation", "data_cluster_stock_corr",
-     "data_stock_corr_yrs"),
-    ("Previous-year AI incoming investment share", "data_cluster_ai_inv_share", "data_ai_inv_share_yrs"),
+    "Previous-year ICT investment share",
+    "Previous-year AI/ICT-related EU export share",
+    "Previous-year national vs. semiconductor index correlation",
+    "Previous-year AI incoming investment share",
 ]
 
 ws_summary.cell(row=11, column=10,
-                 value="J: live-formula check of D/F/G/H (see row 28)").font = Font(
+                 value="J: country-clustered tests for D/F/G/H (see row 28)").font = Font(
     bold=True, italic=True, size=9)
 
-for var_label, cluster_sheet, yrs_sheet in j_col_specs:
+def _format_share_test(label, result):
+    p_value = result["p_value"]
+    if not np.isfinite(p_value):
+        return f"{label}: n/a"
+    marker = result["marker"] or "ns"
+    return f"{label}: p={p_value:.4f} ({marker})"
+
+
+for var_label in j_col_specs:
     header_row_j = block_header_rows[var_label]
-    cp, yp = all_props[var_label]
-
-    def rng(sheet, start, end):
-        return f"'{sheet}'!$G${start}:$G${end}"
-
-    c_below_start, c_below_end = 2, 1 + cp["n_below"]
-    c_above_start, c_above_end = 2 + cp["n_below"], 1 + cp["n_below"] + cp["n_above"]
-    y_below_start, y_below_end = 2, 1 + yp["n_below"]
-    y_above_start, y_above_end = 2 + yp["n_below"], 1 + yp["n_below"] + yp["n_above"]
-
-    c_below_rng = rng(cluster_sheet, c_below_start, c_below_end)
-    c_above_rng = rng(cluster_sheet, c_above_start, c_above_end)
-    c_full_rng = rng(cluster_sheet, c_below_start, c_above_end)
-    y_below_rng = rng(yrs_sheet, y_below_start, y_below_end)
-    y_above_rng = rng(yrs_sheet, y_above_start, y_above_end)
-    y_full_rng = rng(yrs_sheet, y_below_start, y_above_end)
-
-    # D-type: cluster above vs. cluster below (symbol="*")
+    tests = all_share_tests[var_label]
     ws_summary.cell(row=header_row_j, column=10,
-                     value=build_significance_formula(c_above_rng, c_below_rng, symbol="*"))
-    # F-type: yrs full vs. cluster full (symbol="+")
+                    value=_format_share_test("D within", tests["D_within"]))
     ws_summary.cell(row=header_row_j + 1, column=10,
-                     value=build_significance_formula(y_full_rng, c_full_rng, symbol="+"))
-    # G-type: yrs below vs. cluster below (symbol="+")
+                    value=_format_share_test("F across", tests["F_across"]))
     ws_summary.cell(row=header_row_j + 2, column=10,
-                     value=build_significance_formula(y_below_rng, c_below_rng, symbol="+"))
-    # H-type: yrs above vs. cluster above (symbol="+")
+                    value=_format_share_test("G across", tests["G_across"]))
+    h_across = _format_share_test("H across", tests["H_across"])
+    h_within = _format_share_test("H within", tests["H_within"])
     ws_summary.cell(row=header_row_j + 3, column=10,
-                     value=build_significance_formula(y_above_rng, c_above_rng, symbol="+"))
+                    value=f"{h_across}; {h_within}")
 
-ws_summary.column_dimensions["J"].width = 14
+ws_summary.column_dimensions["J"].width = 48
 
 ws_summary.column_dimensions["A"].width = 30
 for col_letter in ("B", "C", "D", "F", "G", "H"):
@@ -1457,10 +1486,10 @@ def _clean_var_label(label):
 def _academic_stars(p_value):
     """Standard academic significance stars from a coefficient's own
     p-value -- ***/**/* for p<0.01/0.05/0.10, "" otherwise. A DIFFERENT
-    convention from significance_stars() above (which uses +/* for a
-    two-proportion z-test between two CELLS, not a single coefficient's
-    own p-value) -- kept separate since they answer different
-    questions and would be confusing to conflate."""
+    convention from the country-clustered share comparisons above (which
+    use +/* for differences between displayed percentages, not a single
+    coefficient's own p-value). The conventions remain separate because
+    they answer different questions."""
     if p_value is None or (isinstance(p_value, float) and np.isnan(p_value)):
         return ""
     if p_value < 0.01:
@@ -1774,34 +1803,27 @@ for i, (var_label, low_label, high_label) in enumerate(variable_chart_specs):
 # periods. CONVERGING lines = the X effect shrinks in shock years;
 # DIVERGING lines = it strengthens (the visual test discussed in chat
 # for whether "high X" amplifies positive surprises specifically
-# during shocks). Each point is annotated with significance stars
-# (***/**/* at the 1%/5%/10% level) for whether High vs. Low differs
-# significantly AT THAT SPECIFIC point (all years / shock years) --
-# reusing the exact same two-proportion z-test already computed for
-# the D/H header-cell stars earlier in this script, applied here to
-# BOTH points instead of just one.
+# during shocks). Each point is annotated with significance stars at
+# the 1%/5%/10% level. The annotations reuse the country-clustered
+# tests already computed for the D/H header cells.
 line_anchor_row = chart_anchor_row + 16
 for i, (var_label, low_label, high_label) in enumerate(variable_chart_specs):
     header_row_b, low_row, high_row, label_col, all_col, shock_col = lowhigh_row_map[var_label]
 
-    cp, yp = all_props[var_label]
+    tests = all_share_tests[var_label]
     # Same-time (within-period) above-vs-below comparison, symbol="*"
     # -- an overall "is there a Low/High gap at all, at this point"
     # indicator, shown once per point (shared by both lines, since
     # both are annotated on the shared x-axis category text).
-    all_years_stars = significance_stars(cp["x_above"], cp["n_above"],
-                                          cp["x_below"], cp["n_below"], symbol="*")
-    shock_years_stars = significance_stars(yp["x_above"], yp["n_above"],
-                                            yp["x_below"], yp["n_below"], symbol="*")
+    all_years_stars = tests["D_within"]["marker"]
+    shock_years_stars = tests["H_within"]["marker"]
     # HORIZONTAL (same-colour-dot) comparison, symbol="+": does the
     # Low line's shock-years point differ significantly from its OWN
     # all-years point, and likewise for the High line -- this is the
-    # exact same two-proportion z-test already computed for the G/H
+    # exact same country-clustered tests already computed for the G/H
     # header-cell "+" markers above, reused here per-line.
-    low_horizontal_plus = significance_stars(yp["x_below"], yp["n_below"],
-                                              cp["x_below"], cp["n_below"], symbol="+")
-    high_horizontal_plus = significance_stars(yp["x_above"], yp["n_above"],
-                                               cp["x_above"], cp["n_above"], symbol="+")
+    low_horizontal_plus = tests["G_across"]["marker"]
+    high_horizontal_plus = tests["H_across"]["marker"]
 
     # Dedicated category row for the INTERACTION PLOT specifically
     # (its own row, not shared with the bar chart's categories above),
@@ -1894,8 +1916,8 @@ charts_end_row = notes_row + len(notes)
 # LIKELY. That second, genuinely different question -- does X raise
 # the PROBABILITY that growth_surprise > 0 -- is what the "share
 # positive surprises" blocks above (and their D/F/G/H significance
-# markers) test via a two-proportion comparison, and what the LOGIT
-# regressions further below test directly via a binary outcome model.
+# markers) test via country-clustered differences in shares, and what
+# the LOGIT regressions further below test directly via a binary outcome model.
 # These two kinds of results can legitimately diverge (e.g. a variable
 # can shift the average size of surprises without changing how often
 # they are positive, or vice versa, if a few large outliers dominate
