@@ -8,6 +8,24 @@ from openpyxl.styles import Font, Alignment, PatternFill
 
 
 # ----------------------------------------------------------------------
+# USER OPTION: Country panel
+# ----------------------------------------------------------------------
+# Edit this one line to change the countries used throughout the script.
+# Use uppercase ISO-2 country codes. The selection is applied to the
+# forecast data and every country-level ai_data.xlsx source before any
+# merges, charts, bivariate tests, or regressions are constructed.
+PANEL_COUNTRIES = ["AT", "BE", "DE", "ES", "FI", "FR", "IE", "IT", "NL", "PT"]
+
+
+# ----------------------------------------------------------------------
+# USER OPTION: Shock years
+# ----------------------------------------------------------------------
+# Edit this one line to change the years used for the shock-year charts,
+# bivariate comparisons, and interaction terms in all regressions.
+SHOCK_YEARS = [2020, 2022, 2025]
+
+
+# ----------------------------------------------------------------------
 # USER OPTION: State Aid control in all regressions
 # ----------------------------------------------------------------------
 # False (default): baseline regressions contain no State Aid control.
@@ -45,14 +63,69 @@ def checked_sheet_name(name, context=""):
     return name
 
 
+def restrict_to_country_panel(df, source_name):
+    """Keep only PANEL_COUNTRIES and report unavailable requested codes."""
+    if "country" not in df.columns:
+        raise ValueError(
+            f"{source_name}: expected a 'country' column for panel filtering; "
+            f"actual columns are {list(df.columns)}")
+
+    filtered = df[df["country"].isin(PANEL_COUNTRIES)].copy()
+    available = set(filtered["country"].dropna().astype(str).unique())
+    missing = [country for country in PANEL_COUNTRIES if country not in available]
+    if missing:
+        print(f"  [!] {source_name}: no observations for requested "
+              f"country code(s) {missing}.")
+    if filtered.empty:
+        raise ValueError(
+            f"{source_name}: none of PANEL_COUNTRIES={PANEL_COUNTRIES} "
+            "is present in this source.")
+    return filtered
+
+
+if not PANEL_COUNTRIES:
+    raise ValueError("PANEL_COUNTRIES must contain at least one ISO-2 country code.")
+if len(PANEL_COUNTRIES) != len(set(PANEL_COUNTRIES)):
+    raise ValueError(f"PANEL_COUNTRIES contains duplicates: {PANEL_COUNTRIES}")
+invalid_panel_codes = [
+    country for country in PANEL_COUNTRIES
+    if not isinstance(country, str) or len(country) != 2 or country != country.upper()
+]
+if invalid_panel_codes:
+    raise ValueError(
+        "PANEL_COUNTRIES must use unique uppercase ISO-2 codes; invalid "
+        f"entries: {invalid_panel_codes}")
+
+if not SHOCK_YEARS:
+    raise ValueError("SHOCK_YEARS must contain at least one year.")
+if len(SHOCK_YEARS) != len(set(SHOCK_YEARS)):
+    raise ValueError(f"SHOCK_YEARS contains duplicates: {SHOCK_YEARS}")
+invalid_shock_years = [
+    year for year in SHOCK_YEARS
+    if not isinstance(year, int) or isinstance(year, bool)
+]
+if invalid_shock_years:
+    raise ValueError(
+        "SHOCK_YEARS must contain unique integer years; invalid "
+        f"entries: {invalid_shock_years}")
+SHOCK_YEARS_LABEL = "/".join(str(year) for year in SHOCK_YEARS)
+SHOCK_YEARS_LIST_TEXT = ", ".join(str(year) for year in SHOCK_YEARS)
+
+
 # --- Load source data ---
-forecast = pd.read_excel("ec_forecast_vs_realized.xlsx")
+forecast = restrict_to_country_panel(
+    pd.read_excel("ec_forecast_vs_realized.xlsx"),
+    "ec_forecast_vs_realized.xlsx",
+)
 ict = pd.read_excel("ai_data.xlsx", sheet_name="ict_inv")[["country", "year", "ict_share"]]
+ict = restrict_to_country_panel(ict, "ai_data.xlsx: ict_inv")
 ict = ict.rename(columns={"year": "target_year"})
 hs_export = pd.read_excel("ai_data.xlsx", sheet_name="hs_export")[["country", "year", "share"]]
+hs_export = restrict_to_country_panel(hs_export, "ai_data.xlsx: hs_export")
 hs_export = hs_export.rename(columns={"year": "target_year", "share": "hs_export_share"})
 
 ai_inv = pd.read_excel("ai_data.xlsx", sheet_name="ai_inv")[["country", "year", "share"]]
+ai_inv = restrict_to_country_panel(ai_inv, "ai_data.xlsx: ai_inv")
 ai_inv = ai_inv.rename(columns={"year": "target_year", "share": "ai_inv_share"})
 
 # Build the optional control only when requested. Column C of sheet "support"
@@ -63,6 +136,8 @@ if INCLUDE_STATE_AID_CONTROL:
     support_raw = pd.read_excel("ai_data.xlsx", sheet_name="support")[[
         "country", "year", "state_aid_m_eur", "gdp_m_eur"
     ]]
+    support_raw = restrict_to_country_panel(
+        support_raw, "ai_data.xlsx: support")
     aid_t = support_raw[["country", "year", "state_aid_m_eur"]].rename(
         columns={"year": "target_year"})
     aid_t["state_aid_source_year"] = aid_t["target_year"]
@@ -91,6 +166,7 @@ else:
 # calculation exactly; the annual average matched a manual mean of
 # that year's quarterly values exactly).
 index_nat = pd.read_excel("ai_data.xlsx", sheet_name="index_nat")[["country", "quarter", "log_ret"]]
+index_nat = restrict_to_country_panel(index_nat, "ai_data.xlsx: index_nat")
 index_sox = pd.read_excel("ai_data.xlsx", sheet_name="index_sox")[["quarter", "log_ret"]]
 index_sox = index_sox.rename(columns={"log_ret": "sox_log_ret"})
 idx_merged = index_nat.merge(index_sox, on="quarter", how="inner")
@@ -147,6 +223,8 @@ merged_ict = add_support_control(merged_ict)
 merged_hs = add_support_control(merged_hs)
 merged_corr = add_support_control(merged_corr)
 merged_ai_inv = add_support_control(merged_ai_inv)
+print(f"Country panel ({len(PANEL_COUNTRIES)}): {', '.join(PANEL_COUNTRIES)}")
+print(f"Shock years ({len(SHOCK_YEARS)}): {SHOCK_YEARS_LIST_TEXT}")
 print("State Aid regression control: "
       + ("ON -- standardized Aid(t)/GDP(t-1)"
          if INCLUDE_STATE_AID_CONTROL else "OFF -- baseline models"))
@@ -732,18 +810,17 @@ def write_clustered_time_chart(wb, cluster_key, merged_df, cluster_col, cluster_
 # each variable's regular charts: growth surprise restricted to ONLY
 # the SPRING-forecast-based surprise (realized[year] -
 # Spring[year]_forecast -- the Autumn round for these years is
-# deliberately excluded) for target years 2020, 2022, and 2025
-# specifically, all countries pooled -- a fixed, hand-picked 3-year
+# deliberately excluded) for the user-selected SHOCK_YEARS
+# specifically, all countries pooled -- a fixed, hand-picked year
 # slice rather than a continuous period range like "since2020"/
 # "till2019", so it needed its own dedicated filter rather than fitting
 # the existing `periods` list.
-SPECIAL_YEARS = [2020, 2022, 2025]
 # Both forecast rounds now included (was Spring-only before) -- for a
 # given target_year, horizon==0 correctly picks out THAT year's own
 # Spring AND Autumn forecast alike (each round's own "current-year"
 # forecast), so each country now contributes up to 2 rows per target
 # year instead of 1.
-SPECIAL_YEARS_ROUNDS = ["Spring", "Autumn"]
+SHOCK_YEARS_ROUNDS = ["Spring", "Autumn"]
 
 
 def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, header, color,
@@ -766,13 +843,13 @@ def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, h
     # that same year's own round (i.e. vintage=="Spring{target_year}"
     # or "Autumn{target_year}"), matching "that year's own forecast,
     # both rounds" as (up to) two rows per country per target year.
-    df = raw_forecast[(raw_forecast["vintage_round"].isin(SPECIAL_YEARS_ROUNDS))
+    df = raw_forecast[(raw_forecast["vintage_round"].isin(SHOCK_YEARS_ROUNDS))
                        & (raw_forecast["horizon"] == 0)
-                       & (raw_forecast["target_year"].isin(SPECIAL_YEARS))].copy()
+                       & (raw_forecast["target_year"].isin(SHOCK_YEARS))].copy()
 
     # Build a (country, source_year) -> explanatory value lookup for the
     # required t-1 years only.
-    lookup_years_needed = {year - 1 for year in SPECIAL_YEARS}
+    lookup_years_needed = {year - 1 for year in SHOCK_YEARS}
     explanatory_lookup = raw_explanatory[
         raw_explanatory["target_year"].isin(lookup_years_needed)
         & raw_explanatory[col].notna()
@@ -799,7 +876,7 @@ def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, h
     df = df[keep_mask].copy()
 
     # Below/above-median classification, computed WITHIN this specific
-    # years-restricted subset (2020/2022/2025 Spring only) -- NOT the
+    # years-restricted shock subset -- NOT the
     # same median as the full-sample cluster sheets, since this is a
     # much smaller, differently-composed sample. Same technique as
     # write_clustered_time_chart(): rows sorted so each cluster is a
@@ -868,8 +945,8 @@ def write_special_years_chart(wb, var_key, raw_forecast, raw_explanatory, col, h
         below_start, below_end, above_start, above_end, col_offset=col_offset,
     )
 
-    years_str = "/".join(str(y) for y in SPECIAL_YEARS)
-    rounds_str = " & ".join(SPECIAL_YEARS_ROUNDS)
+    years_str = SHOCK_YEARS_LABEL
+    rounds_str = " & ".join(SHOCK_YEARS_ROUNDS)
     chart_title = (f"Growth surprise ({rounds_str} forecast) vs. {header} "
                     f"-- {years_str}")
     write_chart_sheet(wb, chart_sheet_name, ws_data, last_row, chart_title, header, color)
@@ -891,7 +968,7 @@ summary_row = group_header_row + 2
 
 
 # --- Each variable's "cluster" (full-sample, below/above median) block
-# and "yrs" (2020/2022/2025 shock-years) block are written SIDE BY SIDE
+# and "yrs" (user-selected shock-years) block are written SIDE BY SIDE
 # on the SAME rows (col_offset=0 for cluster on the left, col_offset=4
 # for yrs on the right) -- not stacked vertically like before -- so the
 # two views of the same variable are directly comparable at a glance.
@@ -1919,7 +1996,7 @@ notes = [
     "Each plot shows two lines -- \"Low\" (below-median) and \"High\" "
     "(above-median) countries for that explanatory variable -- with "
     "their share of positive growth surprises plotted at two points: "
-    "\"All years\" (the full sample) and \"Shock years\" (2020/2022/2025).",
+    f"\"All years\" (the full sample) and \"Shock years\" ({SHOCK_YEARS_LABEL}).",
     "PARALLEL lines mean the Low/High gap is roughly the same size in "
     "both periods -- i.e. the explanatory variable's effect does NOT "
     "change during shocks.",
@@ -2040,7 +2117,7 @@ for col_letter, width in zip(
 # --- Interaction regression: growth_surprise = const + country FE +
 # time FE + beta*X + gamma*(X * shock_year_dummy) -- run on the FULL
 # sample (NOT restricted to shock years only), with shock_year_dummy=1
-# for target_year in {2020, 2022, 2025} and 0 otherwise. This
+# for target_year in the user-selected SHOCK_YEARS and 0 otherwise. This
 # estimates whether the SLOPE of X on growth_surprise is genuinely
 # DIFFERENT during shock years specifically (gamma), on top of the
 # already-controlled-for country and year fixed effects -- a more
@@ -2048,7 +2125,7 @@ for col_letter, width in zip(
 # shocks" than comparing two separately-run regressions on different
 # sub-samples (the shock-years-only table this replaces), since gamma
 # here is estimated jointly with beta on the full, larger sample.
-SHOCK_YEARS_SET = set(SPECIAL_YEARS)
+SHOCK_YEARS_SET = set(SHOCK_YEARS)
 
 interaction_specs = [
     ("Previous-year ICT investment share (data_ict_share_full)", merged_ict, "ict_share"),
@@ -2068,7 +2145,7 @@ ws_summary.cell(
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg2_start_row + 1, column=1,
-    value="(full sample; shock_year_dummy=1 for target_year in 2020/2022/2025 -- gamma "
+    value=f"(full sample; shock_year_dummy=1 for target_year in {SHOCK_YEARS_LABEL} -- gamma "
           "estimates X's ADDITIONAL effect specifically during shock years, on top of "
           "beta's baseline effect)"
 ).font = Font(italic=True, size=9)
