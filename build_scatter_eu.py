@@ -26,14 +26,20 @@ SHOCK_YEARS = [2020, 2022, 2025]
 
 
 # ----------------------------------------------------------------------
-# USER OPTION: State Aid control in all regressions
+# USER OPTIONS: Regression controls
 # ----------------------------------------------------------------------
-# False (default): baseline regressions contain no State Aid control.
+# False: omit the State Aid control.
 # True: add standardized [State aid expenditure in year t / nominal GDP
 #       in year t-1] to every OLS, probit, and logit regression.
 INCLUDE_STATE_AID_CONTROL = True
+# False: omit trade openness. True: add contemporaneous trade openness
+# (outcome year t) to every OLS, probit, and logit regression.
+INCLUDE_TRADE_OPENNESS_CONTROL = True
+
 STATE_AID_CONTROL_RAW = "state_aid_over_lagged_gdp"
 STATE_AID_CONTROL_STD = "state_aid_over_lagged_gdp_std"
+TRADE_OPENNESS_CONTROL_RAW = "trade_openness"
+TRADE_OPENNESS_CONTROL_STD = "trade_openness_std"
 
 
 def restrict_to_country_panel(df, source_name):
@@ -130,6 +136,21 @@ if INCLUDE_STATE_AID_CONTROL:
 else:
     support_control = None
 
+if INCLUDE_TRADE_OPENNESS_CONTROL:
+    trade_openness_control = pd.read_excel(
+        "ai_data.xlsx", sheet_name="trade_openness"
+    )[["country", "year", TRADE_OPENNESS_CONTROL_RAW]]
+    trade_openness_control = restrict_to_country_panel(
+        trade_openness_control, "ai_data.xlsx / trade_openness")
+    trade_openness_control = trade_openness_control.rename(
+        columns={"year": "target_year"})
+    trade_openness_control["trade_openness_source_year"] = (
+        trade_openness_control["target_year"])
+    trade_openness_control = trade_openness_control.drop_duplicates(
+        ["country", "target_year"], keep="first")
+else:
+    trade_openness_control = None
+
 # National-vs-semiconductor index correlation: rolling 8-QUARTER
 # correlation between each country's national index log-return and the
 # global semiconductor index (^SOX) log-return, THEN annualized by
@@ -174,27 +195,38 @@ merged_corr = forecast.merge(
 merged_ai_inv = forecast.merge(ai_inv_lagged, on=["country", "target_year"], how="inner")
 
 
-def add_support_control(df):
-    """Attach optional Aid(t)/GDP(t-1); do nothing in the baseline model."""
-    if not INCLUDE_STATE_AID_CONTROL:
-        return df
-    return df.merge(
-        support_control,
-        on=["country", "target_year"],
-        how="left",
-        validate="many_to_one",
-    )
+def add_regression_controls(df):
+    """Attach the optional controls without changing the focal X variables."""
+    controlled = df
+    if INCLUDE_STATE_AID_CONTROL:
+        controlled = controlled.merge(
+            support_control,
+            on=["country", "target_year"],
+            how="left",
+            validate="many_to_one",
+        )
+    if INCLUDE_TRADE_OPENNESS_CONTROL:
+        controlled = controlled.merge(
+            trade_openness_control,
+            on=["country", "target_year"],
+            how="left",
+            validate="many_to_one",
+        )
+    return controlled
 
 
-merged_ict = add_support_control(merged_ict)
-merged_eur = add_support_control(merged_eur)
-merged_corr = add_support_control(merged_corr)
-merged_ai_inv = add_support_control(merged_ai_inv)
+merged_ict = add_regression_controls(merged_ict)
+merged_eur = add_regression_controls(merged_eur)
+merged_corr = add_regression_controls(merged_corr)
+merged_ai_inv = add_regression_controls(merged_ai_inv)
 print(f"Country panel ({len(PANEL_COUNTRIES)}): {', '.join(PANEL_COUNTRIES)}")
 print(f"Shock years ({len(SHOCK_YEARS)}): {SHOCK_YEARS_LIST_TEXT}")
 print("State Aid regression control: "
       + ("ON -- standardized Aid(t)/GDP(t-1)"
-         if INCLUDE_STATE_AID_CONTROL else "OFF -- baseline models"))
+         if INCLUDE_STATE_AID_CONTROL else "OFF"))
+print("Trade-openness regression control: "
+      + ("ON -- standardized contemporaneous trade_openness(t)"
+         if INCLUDE_TRADE_OPENNESS_CONTROL else "OFF"))
 print(f"previous-year ict_share merge: {len(merged_ict)} rows (from {len(forecast)} forecast rows)")
 print(f"previous-year eur_export share merge: {len(merged_eur)} rows (from {len(forecast)} forecast rows)")
 print(f"previous-year stock/semis correlation merge: {len(merged_corr)} rows (from {len(forecast)} forecast rows)")
@@ -1509,43 +1541,106 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
 def _standardize(series):
     """
     Z-score standardization (x - mean) / sd, per explicit instruction
-    to include X and AboveMedian as standardized variables. When the optional
-    State Aid control is enabled, Aid(t)/GDP(t-1) is standardized too. Dummy
-    and interaction terms remain in their original 0/1 or product scale.
+    to include X and AboveMedian as standardized variables. Every enabled
+    continuous control is standardized too. Dummy and interaction terms
+    remain in their original 0/1 or product scale.
     """
     return (series - series.mean()) / series.std()
 
 
-def _prepare_state_aid_control(df):
-    """Standardize the optional control in-place and return its model columns."""
-    if not INCLUDE_STATE_AID_CONTROL:
+def _active_control_specs():
+    """Return (raw column, standardized column) for enabled controls."""
+    specs = []
+    if INCLUDE_STATE_AID_CONTROL:
+        specs.append((STATE_AID_CONTROL_RAW, STATE_AID_CONTROL_STD))
+    if INCLUDE_TRADE_OPENNESS_CONTROL:
+        specs.append((TRADE_OPENNESS_CONTROL_RAW, TRADE_OPENNESS_CONTROL_STD))
+    return specs
+
+
+def _prepare_regression_controls(df, required_model_cols):
+    """Standardize enabled controls over the exact complete-case model sample."""
+    specs = _active_control_specs()
+    if not specs:
         return []
-    df[STATE_AID_CONTROL_STD] = _standardize(df[STATE_AID_CONTROL_RAW])
-    return [STATE_AID_CONTROL_STD]
+
+    raw_cols = [raw_col for raw_col, _ in specs]
+    sample_cols = list(dict.fromkeys(required_model_cols + raw_cols))
+    complete_case = df[sample_cols].notna().all(axis=1)
+    for raw_col, std_col in specs:
+        df[std_col] = np.nan
+        df.loc[complete_case, std_col] = _standardize(
+            df.loc[complete_case, raw_col])
+    return [std_col for _, std_col in specs]
 
 
-def _state_aid_diagnostic_cols():
-    if not INCLUDE_STATE_AID_CONTROL:
-        return []
-    return [
-        "state_aid_m_eur", "state_aid_source_year",
-        "gdp_m_eur_lag1", "gdp_source_year",
-        STATE_AID_CONTROL_RAW, STATE_AID_CONTROL_STD,
-    ]
+def _control_diagnostic_cols():
+    cols = []
+    if INCLUDE_STATE_AID_CONTROL:
+        cols.extend([
+            "state_aid_m_eur", "state_aid_source_year",
+            "gdp_m_eur_lag1", "gdp_source_year",
+            STATE_AID_CONTROL_RAW, STATE_AID_CONTROL_STD,
+        ])
+    if INCLUDE_TRADE_OPENNESS_CONTROL:
+        cols.extend([
+            "trade_openness_source_year",
+            TRADE_OPENNESS_CONTROL_RAW, TRADE_OPENNESS_CONTROL_STD,
+        ])
+    return cols
 
 
-CONTROL_HEADERS = (
-    ["phi (std Aid(t)/GDP(t-1))", "SE(phi)", "p(phi)"]
-    if INCLUDE_STATE_AID_CONTROL else []
-)
+CONTROL_OUTPUT_SPECS = []
+if INCLUDE_STATE_AID_CONTROL:
+    CONTROL_OUTPUT_SPECS.append((
+        STATE_AID_CONTROL_STD,
+        ["phi (std Aid(t)/GDP(t-1))", "SE(phi)", "p(phi)"],
+    ))
+if INCLUDE_TRADE_OPENNESS_CONTROL:
+    CONTROL_OUTPUT_SPECS.append((
+        TRADE_OPENNESS_CONTROL_STD,
+        ["theta (std Trade openness(t))", "SE(theta)", "p(theta)"],
+    ))
+
+CONTROL_HEADERS = [
+    header
+    for _, headers in CONTROL_OUTPUT_SPECS
+    for header in headers
+]
+
+
+def _write_control_results(ws, row_idx, next_col, result):
+    """Write coefficient, clustered SE, and p-value for every enabled control."""
+    for std_col, _ in CONTROL_OUTPUT_SPECS:
+        stats = result["extra"][std_col]
+        ws.cell(row=row_idx, column=next_col, value=round(stats["beta"], 4))
+        ws.cell(row=row_idx, column=next_col + 1, value=round(stats["se"], 4))
+        ws.cell(row=row_idx, column=next_col + 2, value=round(stats["p_value"], 4))
+        next_col += 3
+    return next_col
+
+
+control_equation_terms = []
+if INCLUDE_STATE_AID_CONTROL:
+    control_equation_terms.append("phi*std[Aid(t)/GDP(t-1)]")
+if INCLUDE_TRADE_OPENNESS_CONTROL:
+    control_equation_terms.append("theta*std[Trade openness(t)]")
 CONTROL_EQUATION_TERM = (
-    " + phi*std[Aid(t)/GDP(t-1)]" if INCLUDE_STATE_AID_CONTROL else ""
+    " + " + " + ".join(control_equation_terms)
+    if control_equation_terms else ""
 )
+
+control_setting_parts = []
+if INCLUDE_STATE_AID_CONTROL:
+    control_setting_parts.append("standardized Aid(t)/GDP(t-1)")
+if INCLUDE_TRADE_OPENNESS_CONTROL:
+    control_setting_parts.append("standardized trade openness(t)")
 CONTROL_SETTING_NOTE = (
-    "State Aid control ON: standardized Aid(t)/GDP(t-1); observations without "
-    "both inputs are excluded."
-    if INCLUDE_STATE_AID_CONTROL
-    else "State Aid control OFF: these are the baseline regressions without that control."
+    "Enabled controls: " + " and ".join(control_setting_parts)
+    + "; observations missing any enabled control are excluded."
+    if control_setting_parts
+    else "Controls OFF: these are the baseline regressions without State Aid "
+         "or trade openness."
 )
 
 
@@ -2038,14 +2133,13 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     # via extra_cols below) in the data_regr sheet for verification.
     x_col_std = x_col + "_std"
     df_src[x_col_std] = _standardize(df_src[x_col])
-    control_cols = _prepare_state_aid_control(df_src)
+    control_cols = _prepare_regression_controls(
+        df_src, ["growth_surprise", x_col_std])
     result = panel_ols_two_way_fe(
         df_src, "growth_surprise", x_col_std, extra_cols=control_cols)
-    phi = (result["extra"][STATE_AID_CONTROL_STD]
-           if INCLUDE_STATE_AID_CONTROL else None)
     write_regression_data_block(
         1, label, df_src, x_col_std,
-        extra_cols=[x_col] + _state_aid_diagnostic_cols())
+        extra_cols=[x_col] + _control_diagnostic_cols())
 
     row_idx = reg_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2053,12 +2147,7 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
     ws_summary.cell(row=row_idx, column=4, value=round(result["t_stat"], 3))
     ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-    next_col = 6
-    if INCLUDE_STATE_AID_CONTROL:
-        ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-        ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-        ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-        next_col += 3
+    next_col = _write_control_results(ws_summary, row_idx, 6, result)
     ws_summary.cell(row=row_idx, column=next_col, value=round(result["r_squared"], 4))
     ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
     ws_summary.cell(row=row_idx, column=next_col + 2, value=result["n_entities"])
@@ -2075,9 +2164,8 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
 # (text overflowing into an adjacent non-empty cell gets visually
 # truncated, not shown). Column I (only used by the regression table,
 # not the summary blocks) can stay narrower.
-for col_letter, width in zip(
-        "BCDEFGHIJKL", [18, 18, 18, 18, 18, 18, 18, 18, 12, 12, 12]):
-    ws_summary.column_dimensions[col_letter].width = width
+for col_letter in "BCDEFGHIJKLMNO":
+    ws_summary.column_dimensions[col_letter].width = 18
 
 # --- Interaction regression: growth_surprise = const + country FE +
 # time FE + beta*X + gamma*(X * shock_year_dummy) -- run on the FULL
@@ -2135,16 +2223,15 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     df_src[x_col_std] = _standardize(df_src[x_col])
     df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
     df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-    control_cols = _prepare_state_aid_control(df_src)
+    control_cols = _prepare_regression_controls(
+        df_src, ["growth_surprise", x_col_std, "interaction"])
     result = panel_ols_two_way_fe(
         df_src, "growth_surprise", x_col_std,
         extra_cols=["interaction"] + control_cols)
     gamma = result["extra"]["interaction"]
-    phi = (result["extra"][STATE_AID_CONTROL_STD]
-           if INCLUDE_STATE_AID_CONTROL else None)
     write_regression_data_block(2, label, df_src, x_col_std,
                                  extra_cols=[x_col, "shock_year_dummy", "interaction",
-                                             ] + _state_aid_diagnostic_cols())
+                                             ] + _control_diagnostic_cols())
 
     row_idx = reg2_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2154,12 +2241,7 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
     ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
     ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-    next_col = 8
-    if INCLUDE_STATE_AID_CONTROL:
-        ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-        ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-        ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-        next_col += 3
+    next_col = _write_control_results(ws_summary, row_idx, 8, result)
     ws_summary.cell(row=row_idx, column=next_col, value=round(result["r_squared"], 4))
     ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
     print(f"  Interaction regression ({label}): beta={result['beta']:.4f} "
@@ -2257,17 +2339,16 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     df_src["above_median"] = _standardize(df_src["above_median_raw"])
     df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
     df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-    control_cols = _prepare_state_aid_control(df_src)
+    control_cols = _prepare_regression_controls(
+        df_src, ["growth_surprise", "above_median", "above_x_shock"])
     result = panel_ols_two_way_fe(
         df_src, "growth_surprise", "above_median",
         extra_cols=["above_x_shock"] + control_cols)
     gamma = result["extra"]["above_x_shock"]
-    phi = (result["extra"][STATE_AID_CONTROL_STD]
-           if INCLUDE_STATE_AID_CONTROL else None)
     write_regression_data_block(3, label, df_src, "above_median",
                                  extra_cols=[x_col, "above_median_raw",
                                              "shock_year_dummy", "above_x_shock",
-                                             ] + _state_aid_diagnostic_cols())
+                                             ] + _control_diagnostic_cols())
 
     row_idx = reg3_header_row + 1 + offset
     ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2277,12 +2358,7 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
     ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
     ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-    next_col = 8
-    if INCLUDE_STATE_AID_CONTROL:
-        ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-        ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-        ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-        next_col += 3
+    next_col = _write_control_results(ws_summary, row_idx, 8, result)
     ws_summary.cell(row=row_idx, column=next_col, value=round(result["r_squared"], 4))
     ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
     print(f"  Above-median interaction regression ({label}): beta={result['beta']:.4f} "
@@ -2348,23 +2424,17 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
         if interaction_col_name is None:
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
-            control_cols = _prepare_state_aid_control(df_src)
+            control_cols = _prepare_regression_controls(
+                df_src, ["growth_surprise", x_col_std])
             result = panel_probit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
                 extra_cols=control_cols)
-            phi = (result["extra"][STATE_AID_CONTROL_STD]
-                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            next_col = 6
-            if INCLUDE_STATE_AID_CONTROL:
-                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-                next_col += 3
+            next_col = _write_control_results(ws_summary, row_idx, 6, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
@@ -2376,13 +2446,12 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-            control_cols = _prepare_state_aid_control(df_src)
+            control_cols = _prepare_regression_controls(
+                df_src, ["growth_surprise", x_col_std, "interaction"])
             result = panel_probit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
                 extra_cols=["interaction"] + control_cols)
             gamma = result["extra"]["interaction"]
-            phi = (result["extra"][STATE_AID_CONTROL_STD]
-                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2390,12 +2459,7 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            next_col = 8
-            if INCLUDE_STATE_AID_CONTROL:
-                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-                next_col += 3
+            next_col = _write_control_results(ws_summary, row_idx, 8, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
@@ -2415,13 +2479,12 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src["above_median"] = _standardize(df_src["above_median_raw"])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-            control_cols = _prepare_state_aid_control(df_src)
+            control_cols = _prepare_regression_controls(
+                df_src, ["growth_surprise", "above_median", "above_x_shock"])
             result = panel_probit_two_way_fe(
                 df_src, "growth_surprise", "above_median",
                 extra_cols=["above_x_shock"] + control_cols)
             gamma = result["extra"]["above_x_shock"]
-            phi = (result["extra"][STATE_AID_CONTROL_STD]
-                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2429,12 +2492,7 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            next_col = 8
-            if INCLUDE_STATE_AID_CONTROL:
-                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-                next_col += 3
+            next_col = _write_control_results(ws_summary, row_idx, 8, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
@@ -2571,7 +2629,9 @@ note_lines = [
     "chart, test, and regression.",
     "     AboveMedian_raw is constructed from that same t-1 explanatory value, and "
     "shock interactions multiply the lagged exposure by the outcome-year shock dummy; "
-    + CONTROL_SETTING_NOTE + " Phi is never included in the compact Regression results table.",
+    + CONTROL_SETTING_NOTE
+    + " Control coefficients phi and theta are never included in the compact "
+      "Regression results table.",
     # Explanatory note on standardization, per explicit instruction --
     # split across several lines, same wrapping reasoning as the notes
     # above.
@@ -2582,8 +2642,10 @@ note_lines = [
     "shock_year_dummy and the interaction terms themselves (X*shock_year_dummy, "
     "AboveMedian*shock_year_dummy) are NOT separately standardized, since they are",
     "     dummy/product terms, not the continuous explanatory variables the "
-    "standardization was requested for. When enabled, Aid(t)/GDP(t-1) is standardized, "
-    "with phi, SE(phi), and p(phi) reported only in the detailed tables.",
+    "standardization was requested for. Each enabled control is standardized over "
+    "the exact complete-case sample used by that regression.",
+    "     The detailed tables report phi, SE(phi), and p(phi) for State Aid and "
+    "theta, SE(theta), and p(theta) for contemporaneous trade openness when enabled.",
     "For OLS (models 4-6): this means beta is directly interpretable as \"a "
     "one-standard-deviation increase in X is associated with a beta-unit change in "
     "growth_surprise (in its own original units), holding other variables constant.\"",
@@ -2669,23 +2731,17 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
         if interaction_col_name is None:
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
-            control_cols = _prepare_state_aid_control(df_src)
+            control_cols = _prepare_regression_controls(
+                df_src, ["growth_surprise", x_col_std])
             result = panel_logit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
                 extra_cols=control_cols)
-            phi = (result["extra"][STATE_AID_CONTROL_STD]
-                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            next_col = 6
-            if INCLUDE_STATE_AID_CONTROL:
-                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-                next_col += 3
+            next_col = _write_control_results(ws_summary, row_idx, 6, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
@@ -2695,13 +2751,12 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
-            control_cols = _prepare_state_aid_control(df_src)
+            control_cols = _prepare_regression_controls(
+                df_src, ["growth_surprise", x_col_std, "interaction"])
             result = panel_logit_two_way_fe(
                 df_src, "growth_surprise", x_col_std,
                 extra_cols=["interaction"] + control_cols)
             gamma = result["extra"]["interaction"]
-            phi = (result["extra"][STATE_AID_CONTROL_STD]
-                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2709,12 +2764,7 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            next_col = 8
-            if INCLUDE_STATE_AID_CONTROL:
-                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-                next_col += 3
+            next_col = _write_control_results(ws_summary, row_idx, 8, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
@@ -2728,13 +2778,12 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             df_src["above_median"] = _standardize(df_src["above_median_raw"])
             df_src["shock_year_dummy"] = df_src["target_year"].isin(SHOCK_YEARS_SET).astype(float)
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
-            control_cols = _prepare_state_aid_control(df_src)
+            control_cols = _prepare_regression_controls(
+                df_src, ["growth_surprise", "above_median", "above_x_shock"])
             result = panel_logit_two_way_fe(
                 df_src, "growth_surprise", "above_median",
                 extra_cols=["above_x_shock"] + control_cols)
             gamma = result["extra"]["above_x_shock"]
-            phi = (result["extra"][STATE_AID_CONTROL_STD]
-                   if INCLUDE_STATE_AID_CONTROL else None)
             ws_summary.cell(row=row_idx, column=1, value=label)
             ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
@@ -2742,12 +2791,7 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            next_col = 8
-            if INCLUDE_STATE_AID_CONTROL:
-                ws_summary.cell(row=row_idx, column=next_col, value=round(phi["beta"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 1, value=round(phi["se"], 4))
-                ws_summary.cell(row=row_idx, column=next_col + 2, value=round(phi["p_value"], 4))
-                next_col += 3
+            next_col = _write_control_results(ws_summary, row_idx, 8, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
             print(f"  Logit ({group_label}, {label}): beta={result['beta']:.4f} "
