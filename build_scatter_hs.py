@@ -32,8 +32,8 @@ SHOCK_YEARS = [2020, 2022, 2025]
 # True: add standardized [State aid expenditure in year t / nominal GDP
 #       in year t-1] to every OLS, probit, and logit regression.
 INCLUDE_STATE_AID_CONTROL = True
-# False: omit trade openness. True: add contemporaneous trade openness
-# (outcome year t) to every OLS, probit, and logit regression.
+# False: omit trade openness. True: add previous-year trade openness
+# (t-1 for an outcome in year t) to every OLS, probit, and logit regression.
 INCLUDE_TRADE_OPENNESS_CONTROL = True
 
 STATE_AID_CONTROL_RAW = "state_aid_over_lagged_gdp"
@@ -169,9 +169,9 @@ if INCLUDE_TRADE_OPENNESS_CONTROL:
     trade_openness_control = restrict_to_country_panel(
         trade_openness_control, "ai_data.xlsx: trade_openness")
     trade_openness_control = trade_openness_control.rename(
-        columns={"year": "target_year"})
-    trade_openness_control["trade_openness_source_year"] = (
-        trade_openness_control["target_year"])
+        columns={"year": "trade_openness_source_year"})
+    trade_openness_control["target_year"] = (
+        trade_openness_control["trade_openness_source_year"] + 1)
     trade_openness_control = trade_openness_control.drop_duplicates(
         ["country", "target_year"], keep="first")
 else:
@@ -257,7 +257,7 @@ print("State Aid regression control: "
       + ("ON -- standardized Aid(t)/GDP(t-1)"
          if INCLUDE_STATE_AID_CONTROL else "OFF"))
 print("Trade-openness regression control: "
-      + ("ON -- standardized contemporaneous trade_openness(t)"
+      + ("ON -- standardized previous-year trade_openness(t-1)"
          if INCLUDE_TRADE_OPENNESS_CONTROL else "OFF"))
 print(f"previous-year ict_share merge: {len(merged_ict)} rows "
       f"(from {len(forecast)} forecast rows)")
@@ -1633,7 +1633,7 @@ if INCLUDE_STATE_AID_CONTROL:
 if INCLUDE_TRADE_OPENNESS_CONTROL:
     CONTROL_OUTPUT_SPECS.append((
         TRADE_OPENNESS_CONTROL_STD,
-        ["theta (std Trade openness(t))", "SE(theta)", "p(theta)"],
+        ["theta (std Trade openness(t-1))", "SE(theta)", "p(theta)"],
     ))
 
 CONTROL_HEADERS = [
@@ -1658,7 +1658,7 @@ control_equation_terms = []
 if INCLUDE_STATE_AID_CONTROL:
     control_equation_terms.append("phi*std[Aid(t)/GDP(t-1)]")
 if INCLUDE_TRADE_OPENNESS_CONTROL:
-    control_equation_terms.append("theta*std[Trade openness(t)]")
+    control_equation_terms.append("theta*std[Trade openness(t-1)]")
 CONTROL_EQUATION_TERM = (
     " + " + " + ".join(control_equation_terms)
     if control_equation_terms else ""
@@ -1668,7 +1668,7 @@ control_setting_parts = []
 if INCLUDE_STATE_AID_CONTROL:
     control_setting_parts.append("standardized Aid(t)/GDP(t-1)")
 if INCLUDE_TRADE_OPENNESS_CONTROL:
-    control_setting_parts.append("standardized trade openness(t)")
+    control_setting_parts.append("standardized trade openness(t-1)")
 CONTROL_SETTING_NOTE = (
     "Enabled controls: " + " and ".join(control_setting_parts)
     + "; observations missing any enabled control are excluded."
@@ -2679,7 +2679,7 @@ note_lines = [
     "standardization was requested for. Each enabled control is standardized over "
     "the exact complete-case sample used by that regression.",
     "     The detailed tables report phi, SE(phi), and p(phi) for State Aid and "
-    "theta, SE(theta), and p(theta) for contemporaneous trade openness when enabled.",
+    "theta, SE(theta), and p(theta) for previous-year trade openness when enabled.",
     "For OLS (models 4-6): this means beta is directly interpretable as \"a "
     "one-standard-deviation increase in X is associated with a beta-unit change in "
     "growth_surprise (in its own original units), holding other variables constant.\"",
