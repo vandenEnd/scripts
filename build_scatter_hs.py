@@ -36,10 +36,23 @@ INCLUDE_STATE_AID_CONTROL = True
 # (t-1 for an outcome in year t) to every OLS, probit, and logit regression.
 INCLUDE_TRADE_OPENNESS_CONTROL = True
 
+# False: omit forecast-type fixed effects.
+# True: add a saturated four-category forecast-type control to every OLS,
+# probit, and logit regression. It is represented by the three terms
+# Autumn, horizon t+1, and Autumn x horizon t+1; Spring forecasts for year t
+# are the omitted reference category. These terms control for systematic
+# differences between Spring/Autumn forecasts and between t/t+1 horizons,
+# without allowing the focal ICT/AI coefficient itself to vary by type.
+INCLUDE_FORECAST_TYPE_FIXED_EFFECTS = True
+
 STATE_AID_CONTROL_RAW = "state_aid_over_lagged_gdp"
 STATE_AID_CONTROL_STD = "state_aid_over_lagged_gdp_std"
 TRADE_OPENNESS_CONTROL_RAW = "trade_openness"
 TRADE_OPENNESS_CONTROL_STD = "trade_openness_std"
+FORECAST_TYPE_CONTROL_COLS = (
+    ["autumn", "horizon_t1", "autumn_x_horizon_t1"]
+    if INCLUDE_FORECAST_TYPE_FIXED_EFFECTS else []
+)
 
 
 def checked_sheet_name(name, context=""):
@@ -122,6 +135,50 @@ forecast = restrict_to_country_panel(
     pd.read_excel("ec_forecast_vs_realized.xlsx"),
     "ec_forecast_vs_realized.xlsx",
 )
+
+# A four-category forecast-type fixed effect is equivalent to the three
+# regressors below, with Spring/t as the omitted reference category:
+#   Autumn + horizon(t+1) + Autumn x horizon(t+1).
+# Construct the terms once on the forecast panel so every subsequent merge and
+# every regression specification uses exactly the same definitions.
+if INCLUDE_FORECAST_TYPE_FIXED_EFFECTS:
+    required_forecast_type_cols = {"vintage_round", "horizon"}
+    missing_forecast_type_cols = sorted(
+        required_forecast_type_cols.difference(forecast.columns))
+    if missing_forecast_type_cols:
+        raise ValueError(
+            "Forecast-type fixed effects require column(s) "
+            f"{missing_forecast_type_cols} in ec_forecast_vs_realized.xlsx."
+        )
+
+    round_normalized = forecast["vintage_round"].astype("string").str.strip().str.lower()
+    invalid_rounds = sorted(
+        round_normalized.dropna()[~round_normalized.dropna().isin(["spring", "autumn"])]
+        .unique().tolist()
+    )
+    if round_normalized.isna().any() or invalid_rounds:
+        raise ValueError(
+            "Forecast-type fixed effects require non-missing vintage_round values "
+            "equal to Spring or Autumn; invalid values: "
+            f"{invalid_rounds}."
+        )
+
+    horizon_numeric = pd.to_numeric(forecast["horizon"], errors="coerce")
+    invalid_horizons = sorted(
+        horizon_numeric.dropna()[~horizon_numeric.dropna().isin([0, 1])]
+        .unique().tolist()
+    )
+    if horizon_numeric.isna().any() or invalid_horizons:
+        raise ValueError(
+            "Forecast-type fixed effects require non-missing horizon values 0 (t) "
+            f"or 1 (t+1); invalid values: {invalid_horizons}."
+        )
+
+    forecast["autumn"] = (round_normalized == "autumn").astype(float)
+    forecast["horizon_t1"] = (horizon_numeric == 1).astype(float)
+    forecast["autumn_x_horizon_t1"] = (
+        forecast["autumn"] * forecast["horizon_t1"])
+
 ict = pd.read_excel("ai_data.xlsx", sheet_name="ict_inv")[["country", "year", "ict_share"]]
 ict = restrict_to_country_panel(ict, "ai_data.xlsx: ict_inv")
 ict = ict.rename(columns={"year": "target_year"})
@@ -259,6 +316,10 @@ print("State Aid regression control: "
 print("Trade-openness regression control: "
       + ("ON -- standardized previous-year trade_openness(t-1)"
          if INCLUDE_TRADE_OPENNESS_CONTROL else "OFF"))
+print("Forecast-type fixed effects: "
+      + ("ON -- Autumn + horizon(t+1) + Autumn x horizon(t+1); "
+         "Spring/t is the reference category"
+         if INCLUDE_FORECAST_TYPE_FIXED_EFFECTS else "OFF"))
 print(f"previous-year ict_share merge: {len(merged_ict)} rows "
       f"(from {len(forecast)} forecast rows)")
 print(f"previous-year hs_export share merge: {len(merged_hs)} rows "
@@ -1243,7 +1304,10 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
     sandwich estimator and finite-sample correction as logit and probit.
     """
     extra_cols = extra_cols or []
-    needed_cols = [y_col, x_col, entity_col, time_col] + extra_cols
+    needed_cols = (
+        [y_col, x_col, entity_col, time_col]
+        + extra_cols + FORECAST_TYPE_CONTROL_COLS
+    )
     d = df[needed_cols].dropna().copy()
     n_obs = len(d)
     entities = sorted(d[entity_col].unique())
@@ -1252,7 +1316,7 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
     time_dummies = pd.get_dummies(d[time_col], prefix="t", drop_first=True, dtype=float)
     X = pd.concat([
         pd.Series(1.0, index=d.index, name="const"),
-        d[[x_col] + extra_cols].astype(float),
+        d[[x_col] + extra_cols + FORECAST_TYPE_CONTROL_COLS].astype(float),
         entity_dummies,
         time_dummies,
     ], axis=1)
@@ -1352,7 +1416,10 @@ def panel_logit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="tar
     error.
     """
     extra_cols = extra_cols or []
-    needed_cols = [y_col, x_col, entity_col, time_col] + extra_cols
+    needed_cols = (
+        [y_col, x_col, entity_col, time_col]
+        + extra_cols + FORECAST_TYPE_CONTROL_COLS
+    )
     d = df[needed_cols].dropna().copy()
     n_obs = len(d)
     entities = sorted(d[entity_col].unique())
@@ -1378,7 +1445,7 @@ def panel_logit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="tar
     time_dummies = pd.get_dummies(d[time_col], prefix="t", drop_first=True, dtype=float)
     X = pd.concat([
         pd.Series(1.0, index=d.index, name="const"),
-        d[[x_col] + extra_cols].astype(float),
+        d[[x_col] + extra_cols + FORECAST_TYPE_CONTROL_COLS].astype(float),
         entity_dummies,
         time_dummies,
     ], axis=1)
@@ -1467,7 +1534,10 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
     countries (clusters) are assumed independent of one another.
     """
     extra_cols = extra_cols or []
-    needed_cols = [y_col, x_col, entity_col, time_col] + extra_cols
+    needed_cols = (
+        [y_col, x_col, entity_col, time_col]
+        + extra_cols + FORECAST_TYPE_CONTROL_COLS
+    )
     d = df[needed_cols].dropna().copy()
     n_obs = len(d)
     entities = sorted(d[entity_col].unique())
@@ -1488,7 +1558,7 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
     time_dummies = pd.get_dummies(d[time_col], prefix="t", drop_first=True, dtype=float)
     X = pd.concat([
         pd.Series(1.0, index=d.index, name="const"),
-        d[[x_col] + extra_cols].astype(float),
+        d[[x_col] + extra_cols + FORECAST_TYPE_CONTROL_COLS].astype(float),
         entity_dummies,
         time_dummies,
     ], axis=1)
@@ -1677,6 +1747,17 @@ CONTROL_SETTING_NOTE = (
          "or trade openness."
 )
 
+FORECAST_TYPE_EQUATION_TERM = (
+    " + forecast-type FE[Autumn, horizon(t+1), Autumn*horizon(t+1)]"
+    if INCLUDE_FORECAST_TYPE_FIXED_EFFECTS else ""
+)
+FORECAST_TYPE_SETTING_NOTE = (
+    " Forecast-type fixed effects are ON: Autumn, horizon(t+1), and their "
+    "interaction are included, with Spring/t as the reference category."
+    if INCLUDE_FORECAST_TYPE_FIXED_EFFECTS
+    else " Forecast-type fixed effects are OFF."
+)
+
 
 def _clean_var_label(label):
     """Strips both the "(data_..._full)" sheet-reference suffix and
@@ -1739,9 +1820,15 @@ def write_regression_data_block(regression_number, label, df_src, x_col, extra_c
     """
     extra_cols = extra_cols or []
     cols = ["country", "target_year"]
+    if INCLUDE_FORECAST_TYPE_FIXED_EFFECTS:
+        # Show both the original forecast identifiers and the three actual
+        # regression terms so the saturated four-category control is fully
+        # auditable in the workbook's regression-data sheet.
+        cols += ["vintage_round", "horizon"] + FORECAST_TYPE_CONTROL_COLS
     if "explanatory_source_year" in df_src.columns:
         cols.append("explanatory_source_year")
     cols += ["growth_surprise", x_col] + extra_cols
+    cols = list(dict.fromkeys(cols))
     d = df_src[cols].dropna().copy()
 
     title_row = data_regr_row[0]
@@ -2137,12 +2224,13 @@ ws_summary.cell(
           "further below, and the 'share positive surprises' blocks above, "
           "test instead). Every X is aligned strictly at t-1 relative to the "
           "outcome year t; observations without that prior-year value are excluded. "
-          + CONTROL_SETTING_NOTE
+          + CONTROL_SETTING_NOTE + FORECAST_TYPE_SETTING_NOTE
 ).font = Font(italic=True, size=9, color="800000")
 reg_start_row += 2
 ws_summary.cell(row=reg_start_row, column=1,
     value="Panel regressions: growth_surprise(t) = const + country FE + "
-                       "time FE + beta*X(t-1)" + CONTROL_EQUATION_TERM).font = Font(
+                       "time FE + beta*X(t-1)" + CONTROL_EQUATION_TERM
+                       + FORECAST_TYPE_EQUATION_TERM).font = Font(
     bold=True, size=12)
 ws_summary.cell(
     row=reg_start_row + 1, column=1,
@@ -2228,7 +2316,7 @@ ws_summary.cell(
     row=reg2_start_row, column=1,
     value="Panel regressions WITH SHOCK-YEAR INTERACTION: growth_surprise = const + "
           "country FE + time FE + beta*X + gamma*(X*shock_year_dummy)"
-          + CONTROL_EQUATION_TERM
+          + CONTROL_EQUATION_TERM + FORECAST_TYPE_EQUATION_TERM
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg2_start_row + 1, column=1,
@@ -2307,7 +2395,8 @@ ws_summary.cell(
     row=reg3_start_row, column=1,
     value="Panel regressions WITH ABOVE-MEDIAN VARIABLE AND SHOCK-YEAR INTERACTION: "
           "growth_surprise = const + country FE + time FE + beta*AboveMedian + "
-          "gamma*(AboveMedian*shock_year_dummy) " + CONTROL_EQUATION_TERM
+          "gamma*(AboveMedian*shock_year_dummy)" + CONTROL_EQUATION_TERM
+          + FORECAST_TYPE_EQUATION_TERM
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=reg3_start_row + 1, column=1,
@@ -2414,7 +2503,8 @@ ws_summary.cell(
     row=probit_primary_start_row, column=1,
     value="PROBIT versions of the three panel regressions above: "
           "P(growth_surprise > 0) = Phi(const + country FE + time FE + beta*X "
-          "[+ gamma*interaction] " + CONTROL_EQUATION_TERM + ")"
+          "[+ gamma*interaction]" + CONTROL_EQUATION_TERM
+          + FORECAST_TYPE_EQUATION_TERM + ")"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=probit_primary_start_row + 1, column=1,
@@ -2663,7 +2753,7 @@ note_lines = [
     "chart, test, and regression.",
     "     AboveMedian_raw is constructed from that same t-1 explanatory value, and "
     "shock interactions multiply the lagged exposure by the outcome-year shock dummy. "
-    + CONTROL_SETTING_NOTE
+    + CONTROL_SETTING_NOTE + FORECAST_TYPE_SETTING_NOTE
     + " Control coefficients phi and theta are never included in the compact "
       "Regression results table.",
     # Explanatory note on standardization, per explicit instruction --
