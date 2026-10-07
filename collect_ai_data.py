@@ -23,13 +23,17 @@ FUTURE-PROOFING, stated honestly (what is and isn't automatic here):
     hardcoded date -- Eurostat/World Bank/Yahoo Finance sources below
     will pick up newly published data automatically on every run,
     with no manual date bump ever needed again.
-  - The WUI download URL CANNOT be made fully automatic -- each new
-    WUI release is published at an unpredictable new URL (not a
-    stable/versioned endpoint), so the hardcoded URL in
-    fetch_wui_global() will eventually go stale. What IS automated:
-    a staleness check that prints a loud, actionable warning (with
-    the exact URL to check) if the most recently fetched WUI quarter
-    is more than ~9 months behind today.
+  - WUI's dated release URL is discovered from the official WUI data
+    page on every run. A WordPress-media lookup and the last known
+    working URL are retained as fallbacks, and a staleness warning
+    still fires if the selected release itself is unexpectedly old.
+  - Both Comext export fetchers request through the current calendar
+    year and retain whatever annual observations Eurostat has actually
+    published. No manual end-year change is required.
+  - State Aid's end year is inferred from the live Scoreboard export.
+    The latest year is included once all configured countries are
+    present; an incomplete newest release is reported and temporarily
+    excluded rather than creating an accidentally unbalanced panel.
   - The local AI-patents/AI-investment files (from cat.eto.tech, no
     scriptable API exists) have the same limitation and the same kind
     of staleness check -- a warning fires if the local file's most
@@ -65,8 +69,11 @@ import time
 import datetime
 import json
 import uuid
+import html
+import re
 from http.cookies import SimpleCookie
 from pathlib import Path
+from urllib.parse import urljoin, urlparse
 
 
 def install_if_needed(package, import_name=None):
@@ -169,7 +176,6 @@ COUNTRIES_ISO3 = list(ISO3_TO_ISO2.keys())
 
 # European Commission State Aid Scoreboard (Qlik public dashboard).
 STATE_AID_START_YEAR = 2000
-STATE_AID_END_YEAR = 2024
 STATE_AID_HOST = "dashboard.tech.ec.europa.eu"
 STATE_AID_PREFIX = "/qs_digit_dashboard_mt/public/"
 STATE_AID_APP_ID = "8d6e06f5-8793-4d78-88c5-1ab928742900"
@@ -508,79 +514,131 @@ def _yf_close_series(ticker):
 # 1. Global shock series -- WUI, GPR, EPU, TPU, GSCPI
 # ----------------------------------------------------------------------
 
+WUI_DATA_PAGE = "https://worlduncertaintyindex.com/data/"
+WUI_MEDIA_API = "https://worlduncertaintyindex.com/wp-json/wp/v2/media"
+WUI_LAST_KNOWN_URL = (
+    "https://worlduncertaintyindex.com/wp-content/uploads/2026/07/"
+    "WUI_Data.xlsx"
+)
+
+
+def _wui_download_candidates():
+    """Return current WUI workbook URLs, newest/most authoritative first."""
+    candidates = []
+
+    # Primary route: the official data page always links the current
+    # quarterly workbook even though its dated wp-content URL changes.
+    try:
+        page = _requests_get_with_retry(WUI_DATA_PAGE, timeout=60)
+        for href in re.findall(r"href\s*=\s*['\"]([^'\"]+)['\"]", page.text,
+                               flags=re.IGNORECASE):
+            url = urljoin(WUI_DATA_PAGE, html.unescape(href))
+            if Path(urlparse(url).path).name.lower() == "wui_data.xlsx":
+                candidates.append(url)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        print(f"  [!] WUI data-page discovery failed ({exc}); trying the "
+              "WordPress media catalogue.")
+
+    # Secondary route: the site's media catalogue often exposes the newest
+    # upload even if the HTML layout of the data page changes.
+    try:
+        media = _requests_get_with_retry(
+            WUI_MEDIA_API,
+            params={"search": "WUI_Data", "per_page": 100,
+                    "orderby": "date", "order": "desc"},
+            timeout=60,
+        ).json()
+        if isinstance(media, list):
+            for item in media:
+                url = item.get("source_url", "") if isinstance(item, dict) else ""
+                if Path(urlparse(url).path).name.lower() == "wui_data.xlsx":
+                    candidates.append(url)
+    except (requests.exceptions.RequestException, ValueError) as exc:
+        print(f"  [!] WUI media-catalogue discovery failed ({exc}); using "
+              "the remaining candidate URL(s).")
+
+    # This keeps a temporary website or API-layout failure from blocking an
+    # otherwise reproducible run. Staleness is checked after parsing.
+    candidates.append(WUI_LAST_KNOWN_URL)
+    return list(dict.fromkeys(candidates))
+
+
 def fetch_wui_global():
     """
     Quarterly Global World Uncertainty Index (WUI), GDP-weighted average
-    across countries. Ahir, Bloom & Furceri, NBER WP 29763.
-    Source: https://worlduncertaintyindex.com/wp-content/uploads/2026/07/WUI_Data.xlsx
-    Sheet "F1", header row 2, columns "year" (e.g. "1990q1") and "WUI".
-    From ai_model_WUI_pat_inv.py.
+    across countries. The current release URL is discovered automatically
+    from the official data page/WordPress catalogue on every run.
     """
-    url = ("https://worlduncertaintyindex.com/wp-content/uploads/2026/07/"
-           "WUI_Data.xlsx")
-    r = _requests_get_with_retry(url, timeout=60)
+    errors = []
+    df = None
+    selected_url = None
 
-    candidate = pd.read_excel(io.BytesIO(r.content), sheet_name="F1", header=2)
-    cols_upper = [str(c).strip().upper() for c in candidate.columns]
-
-    date_col = next((c for c, cu in zip(candidate.columns, cols_upper) if cu == "YEAR"), None)
-    value_col = next((c for c, cu in zip(candidate.columns, cols_upper) if cu == "WUI"), None)
-
-    if date_col is None or value_col is None:
-        sheets = pd.read_excel(io.BytesIO(r.content), sheet_name=None, header=None, nrows=5)
-        raise ValueError(
-            "fetch_wui_global: expected columns 'year' and 'WUI' not found "
-            f"at header row 2 of sheet 'F1' (got columns: {list(candidate.columns)}). "
-            "First 5 raw rows of every sheet: "
-            f"{ {name: d.values.tolist() for name, d in sheets.items()} }."
-        )
-
-    df = candidate[[date_col, value_col]].rename(
-        columns={date_col: "quarter_raw", value_col: "wui_global"}
-    )
-    df["wui_global"] = pd.to_numeric(df["wui_global"], errors="coerce")
-
-    def _parse_quarter(v):
-        if pd.isna(v):
-            return pd.NaT
-        if isinstance(v, pd.Timestamp):
-            return v.to_period("Q")
-        s = str(v).strip().upper().replace(" ", "")
+    for url in _wui_download_candidates():
         try:
-            return pd.Period(s, freq="Q")
-        except Exception:
-            try:
-                return pd.Timestamp(v).to_period("Q")
-            except Exception:
-                return pd.NaT
+            response = _requests_get_with_retry(url, timeout=60)
+            candidate = pd.read_excel(
+                io.BytesIO(response.content), sheet_name="F1", header=2)
+            cols_upper = [str(c).strip().upper() for c in candidate.columns]
+            date_col = next(
+                (c for c, cu in zip(candidate.columns, cols_upper)
+                 if cu == "YEAR"), None)
+            value_col = next(
+                (c for c, cu in zip(candidate.columns, cols_upper)
+                 if cu == "WUI"), None)
+            if date_col is None or value_col is None:
+                raise ValueError(
+                    "expected YEAR/WUI columns in sheet F1 at header row 2; "
+                    f"found {list(candidate.columns)}")
 
-    df["quarter"] = df["quarter_raw"].apply(_parse_quarter)
-    df = df.dropna(subset=["quarter", "wui_global"]).sort_values("quarter")
+            parsed = candidate[[date_col, value_col]].rename(
+                columns={date_col: "quarter_raw", value_col: "wui_global"})
+            parsed["wui_global"] = pd.to_numeric(
+                parsed["wui_global"], errors="coerce")
 
-    if df.empty:
-        raise ValueError("fetch_wui_global: zero valid (quarter, value) rows after parsing.")
+            def _parse_quarter(value):
+                if pd.isna(value):
+                    return pd.NaT
+                if isinstance(value, pd.Timestamp):
+                    return value.to_period("Q")
+                text = str(value).strip().upper().replace(" ", "")
+                try:
+                    return pd.Period(text, freq="Q")
+                except Exception:
+                    try:
+                        return pd.Timestamp(value).to_period("Q")
+                    except Exception:
+                        return pd.NaT
 
+            parsed["quarter"] = parsed["quarter_raw"].apply(_parse_quarter)
+            parsed = parsed.dropna(
+                subset=["quarter", "wui_global"]).sort_values("quarter")
+            if parsed.empty:
+                raise ValueError("zero valid quarter/value rows after parsing")
+            df = parsed
+            selected_url = url
+            break
+        except (requests.exceptions.RequestException, ValueError, KeyError,
+                OSError, ImportError) as exc:
+            errors.append(f"{url}: {exc}")
+
+    if df is None:
+        raise RuntimeError(
+            "fetch_wui_global: no discovered WUI workbook could be read. "
+            "Attempts:\n  - " + "\n  - ".join(errors))
+
+    print(f"  [diagnostic] WUI source selected automatically: {selected_url}")
     print(f"  [diagnostic] WUI: {len(df)} quarters, "
           f"{df['quarter'].min()}-{df['quarter'].max()}.")
-    # STALENESS CHECK: the URL above is hardcoded with a specific
-    # publication month/year, since WUI publishes each new release at
-    # an unpredictable new URL (not a stable/versioned endpoint this
-    # script could reconstruct automatically) -- this cannot be made
-    # fully future-proof the way SAMPLE_END above was. What CAN be
-    # automated is detecting when this hardcoded URL has gone stale:
-    # WUI is published roughly quarterly, so if the most recent
-    # quarter in the data we just parsed is more than ~9 months behind
-    # today, the hardcoded URL is very likely pointing at an outdated
-    # release and needs updating by hand.
+
+    # WUI normally updates quarterly. Discovery can still return an old file
+    # during a website publishing error, so retain an explicit freshness check.
     latest_quarter_end = df["quarter"].max().end_time.date()
     staleness_days = (datetime.date.today() - latest_quarter_end).days
     if staleness_days > 270:
-        print(f"  [!] WARNING: WUI's most recent quarter ({df['quarter'].max()}) is "
-              f"{staleness_days} days behind today -- the hardcoded URL above "
-              f"(.../wp-content/uploads/2026/07/WUI_Data.xlsx) is very likely pointing "
-              f"at an outdated release. Visit https://worlduncertaintyindex.com "
-              f"directly, find the current download link for WUI_Data.xlsx, and update "
-              f"the url variable in fetch_wui_global() to match.")
+        print(f"  [!] WARNING: the automatically discovered WUI release ends "
+              f"in {df['quarter'].max()}, {staleness_days} days behind today. "
+              f"Check {WUI_DATA_PAGE} for a publication problem or changed "
+              "workbook format.")
     return df[["quarter", "wui_global"]]
 
 
@@ -1563,19 +1621,22 @@ def fetch_hs_export_data():
     """
     HS2022 847150+847180+847330+848610+848620+848630+848640+848690
     exports and total merchandise exports to the World for the target
-    countries and all available years through 2025.
+    countries and all available years through the current calendar year.
 
     Source: Eurostat Comext DS-059341, "International trade of EU and
     non-EU countries since 2002 by HS2-4-6". The previous OECD BIMTS
     HS2017 dataflow ended at 2024; Comext supplies the requested detailed
-    products for 2025. Comext expects bare six-digit product codes (not
+    products from 2025 onward. Comext expects bare six-digit product codes (not
     the OECD-specific ``HS17_``/``HS22_`` prefixes) and ``TOTAL`` for all
     merchandise. Each reporter/product is requested separately because
     this API returns zero observations for "+"-joined filters; all years
     are requested together to keep the total number of calls manageable.
     """
     start_year = max(2002, int(SAMPLE_START[:4]))
-    end_year = min(2025, int(SAMPLE_END[:4]))
+    # Request through the current year. If Eurostat has not published any
+    # observations for it yet, the response simply ends in the latest year
+    # available; no source-code end-year bump is needed in future runs.
+    end_year = datetime.date.today().year
     product_codes = HS_CODES + ["TOTAL"]
     all_rows = []
     failed_requests = []
@@ -1639,11 +1700,15 @@ def fetch_hs_export_data():
         subset=["country", "hs_code_raw", "year", "value_eur"]
     )
 
-    if end_year >= 2025 and not (filtered["year"] == 2025).any():
-        raise SystemExit(
-            f"\nfetch_hs_export_data: {HS_EXPORT_DATASET} returned no 2025 "
-            "observations, although 2025 was explicitly requested."
-        )
+    latest_year = int(filtered["year"].max())
+    if latest_year < end_year:
+        print(f"  [diagnostic] {HS_EXPORT_DATASET} currently ends in "
+              f"{latest_year}; no observations for {end_year} have been "
+              "published yet.")
+    elif latest_year == end_year:
+        print(f"  [!] NOTE: {end_year} is the current calendar year; annual "
+              "Comext values may represent year-to-date trade until Eurostat "
+              "publishes the completed year.")
 
     wide = filtered.pivot_table(
         index=["country", "year"], columns="hs_code_raw",
@@ -1691,7 +1756,7 @@ def fetch_eur_export_data():
     """
     Export values (EUR) for CPA 2.2 product groups 26.1, 26.2, and 28.99,
     plus the total export value, BOTH intra-EU and extra-EU, for the 10
-    target euro area countries, 2000-2025 -- from Comext dataset
+    target euro area countries, 2002 through the current year -- from Comext dataset
     DS-059366 ("International trade of EU and non-EU countries since
     2002 by CPA 2.2"), per explicit instruction.
 
@@ -1726,7 +1791,7 @@ def fetch_eur_export_data():
     2025 onward (Commission Delegated Regulation (EU) 2024/3103) -- this
     dataset's own title ("since 2002 by CPA 2.2") indicates Eurostat has
     back-cast the full historical series onto CPA 2.2, so requesting
-    2000-2025 here is consistent with how the dataset is meant to be
+    the historical period here is consistent with how the dataset is meant to be
     used, not a mismatch with when CPA 2.2 itself was adopted.
 
     Batches by ONE (year, partner, country, product) combination per
@@ -1749,7 +1814,7 @@ def fetch_eur_export_data():
     # error, so those years are skipped here rather than requested and
     # guaranteed to fail.
     start_year = max(2002, int(SAMPLE_START[:4]))
-    end_year = min(2025, int(SAMPLE_END[:4]))
+    end_year = datetime.date.today().year
 
     # DISCOVERY STEP: find the dataset's REAL, VALIDATED product codes
     # for CPA 26.1, 26.2, 28.99, and "total", the REAL intra-EU partner
@@ -1760,9 +1825,37 @@ def fetch_eur_export_data():
     # likely to have complete, non-camouflaged data than the earliest
     # years) and the FIRST country in COUNTRIES (arbitrary -- product/
     # partner codes don't vary by reporter).
-    discovered, intra_partner_code, reporter_can_join, product_can_join = _discover_cpa_codes(
-        reporter_probe=COUNTRIES[0], dataset=CPA_EUR_EXPORT_DATASET,
-        base_url=COMEXT_BASE, probe_year=end_year, all_reporters=COUNTRIES)
+    # The current year may not yet contain observations. Discover codes using
+    # the newest year that validates successfully, while still requesting all
+    # years through the current year below.
+    discovery_result = None
+    discovery_errors = []
+    for probe_year in range(end_year, max(start_year, end_year - 5) - 1, -1):
+        try:
+            candidate_result = _discover_cpa_codes(
+                reporter_probe=COUNTRIES[0], dataset=CPA_EUR_EXPORT_DATASET,
+                base_url=COMEXT_BASE, probe_year=probe_year,
+                all_reporters=COUNTRIES)
+        except (ValueError, requests.exceptions.RequestException) as exc:
+            discovery_errors.append(f"{probe_year}: {exc}")
+            continue
+        candidate_codes, candidate_intra, _, _ = candidate_result
+        if (candidate_intra is not None
+                and all(candidate_codes.get(key) is not None
+                        for key in ("26.1", "26.2", "28.99", "total"))):
+            discovery_result = candidate_result
+            print(f"  [diagnostic] CPA code discovery used latest valid "
+                  f"year {probe_year}.")
+            break
+
+    if discovery_result is None:
+        detail = "\n  - ".join(discovery_errors) or "no year validated"
+        raise SystemExit(
+            "\nfetch_eur_export_data: CPA code discovery failed for the "
+            f"current year and five preceding years. Attempts:\n  - {detail}")
+
+    (discovered, intra_partner_code,
+     reporter_can_join, product_can_join) = discovery_result
     code_map = {  # target label -> real dataset code (or None if unresolved)
         "CPA_261": discovered.get("26.1"),
         "CPA_262": discovered.get("26.2"),
@@ -1941,6 +2034,16 @@ def fetch_eur_export_data():
     cpa_sum = wide[cpa_cols].sum(axis=1, skipna=True)
     total_all = wide["total_export_intra"].fillna(0) + wide["total_export_extra"].fillna(0)
     wide["share"] = np.where(total_all == 0, 0.0, cpa_sum / total_all)
+
+    latest_year = int(wide["year"].max())
+    if latest_year < end_year:
+        print(f"  [diagnostic] {CPA_EUR_EXPORT_DATASET} currently ends in "
+              f"{latest_year}; no observations for {end_year} have been "
+              "published yet.")
+    elif latest_year == end_year:
+        print(f"  [!] NOTE: {end_year} is the current calendar year; annual "
+              "Comext values may represent year-to-date trade until Eurostat "
+              "publishes the completed year.")
 
     print(f"  [diagnostic] CPA 2.2 EU export data (DS-059366): {wide.shape[0]} "
           f"country-year rows, {wide['country'].nunique()} countries, years "
@@ -2380,7 +2483,7 @@ def _fetch_state_aid_scoreboard_export():
 
 
 def fetch_government_support_share():
-    """Return State aid expenditure and its GDP share for 2000-2024."""
+    """Return State aid expenditure/GDP through the latest complete year."""
     raw = _fetch_state_aid_scoreboard_export()
     country_col = _find_state_aid_column(raw.columns, ("member", "state"))
     year_col = _find_state_aid_column(raw.columns, ("expenditure", "year"))
@@ -2409,17 +2512,45 @@ def fetch_government_support_share():
     state_aid = state_aid[
         state_aid["country"].isin(COUNTRIES)
         & state_aid["year"].between(
-            STATE_AID_START_YEAR, STATE_AID_END_YEAR)
+            STATE_AID_START_YEAR, datetime.date.today().year)
     ].dropna(subset=["state_aid_m_eur"])
     state_aid = (state_aid.groupby(["country", "year"], as_index=False)
                  ["state_aid_m_eur"].sum())
     state_aid["year"] = state_aid["year"].astype(int)
 
+    if state_aid.empty:
+        raise ValueError(
+            "The live State Aid export contains no usable observations for "
+            f"the configured countries from {STATE_AID_START_YEAR} onward.")
+
+    # A new Scoreboard vintage can briefly expose an incomplete newest year.
+    # Extend the output only through the newest year containing every country,
+    # preserving the balanced panel expected by the modelling scripts.
+    countries_per_year = state_aid.groupby("year")["country"].nunique()
+    complete_years = countries_per_year[
+        countries_per_year == len(COUNTRIES)].index.tolist()
+    if not complete_years:
+        raise ValueError(
+            "The live State Aid export has no year containing all configured "
+            f"countries: {COUNTRIES}.")
+    latest_complete_year = int(max(complete_years))
+    latest_source_year = int(state_aid["year"].max())
+    if latest_source_year > latest_complete_year:
+        missing_latest = sorted(
+            set(COUNTRIES) - set(state_aid.loc[
+                state_aid["year"] == latest_source_year, "country"]))
+        print(f"  [!] State Aid year {latest_source_year} is present but "
+              f"incomplete for this panel (missing {missing_latest}); it is "
+              f"temporarily excluded. Latest complete year: "
+              f"{latest_complete_year}.")
+    state_aid = state_aid[
+        state_aid["year"] <= latest_complete_year].copy()
+
     gdp_raw = eurostat_json_to_df("nama_10_gdp", {
         "freq": "A", "unit": "CP_MEUR", "na_item": "B1GQ",
         "geo": COUNTRIES,
         "sinceTimePeriod": str(STATE_AID_START_YEAR),
-        "untilTimePeriod": str(STATE_AID_END_YEAR),
+        "untilTimePeriod": str(latest_complete_year),
     })
     gdp = gdp_raw.rename(columns={"geo": "country", "time": "year"})
     gdp["year"] = pd.to_numeric(gdp["year"], errors="coerce")
@@ -2437,7 +2568,7 @@ def fetch_government_support_share():
 
     expected = {
         (country, year) for country in COUNTRIES
-        for year in range(STATE_AID_START_YEAR, STATE_AID_END_YEAR + 1)
+        for year in range(STATE_AID_START_YEAR, latest_complete_year + 1)
     }
     actual = set(output[["country", "year"]].itertuples(
         index=False, name=None))
@@ -2445,8 +2576,9 @@ def fetch_government_support_share():
     unexpected = sorted(actual - expected)
     if missing or unexpected:
         raise ValueError(
-            "State Aid output does not have the required balanced 2000-2024 "
-            f"panel. Missing={missing[:15]}; unexpected={unexpected[:15]}")
+            "State Aid output does not have the required balanced "
+            f"{STATE_AID_START_YEAR}-{latest_complete_year} panel. "
+            f"Missing={missing[:15]}; unexpected={unexpected[:15]}")
     if output["gdp_m_eur"].isna().any() or output["support_share"].isna().any():
         raise ValueError("Nominal GDP is missing for at least one State Aid row.")
 
