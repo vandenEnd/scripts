@@ -30,15 +30,15 @@ SHOCK_YEARS = [2020, 2022, 2025]
 # ----------------------------------------------------------------------
 # False: omit the State Aid control.
 # True: add standardized [State aid expenditure in year t / nominal GDP
-#       in year t-1] to every OLS, probit, and logit regression.
+#       in year t-1] to every OLS, LPM, CRE-probit, and logit regression.
 INCLUDE_STATE_AID_CONTROL = True
 # False: omit trade openness. True: add previous-year trade openness
-# (t-1 for an outcome in year t) to every OLS, probit, and logit regression.
+# (t-1 for an outcome in year t) to every OLS, LPM, CRE-probit, and logit regression.
 INCLUDE_TRADE_OPENNESS_CONTROL = True
 
 # False: omit forecast-type fixed effects.
 # True: add a saturated four-category forecast-type control to every OLS,
-# probit, and logit regression. It is represented by the three terms
+# LPM, CRE-probit, and logit regression. It is represented by the three terms
 # Autumn, horizon t+1, and Autumn x horizon t+1; Spring forecasts for year t
 # are the omitted reference category. These terms control for systematic
 # differences between Spring/Autumn forecasts and between t/t+1 horizons,
@@ -1224,7 +1224,7 @@ for col_letter in ("B", "C", "D", "F", "G", "H"):
 # entirely and guarantees this regression uses the exact same numbers
 # the "_full" sheets display.
 #
-# All OLS, logit, and probit regressions below use country-clustered
+# All OLS, LPM, logit, and CRE-probit regressions below use country-clustered
 # sandwich standard errors with the same finite-sample correction,
 # equivalent to Stata's vce(cluster country_id).
 from scipy import stats as _stats
@@ -1232,7 +1232,7 @@ from scipy import stats as _stats
 
 def _country_clustered_cov(bread, score_obs, cluster_labels, estimator_name):
     """
-    Country-clustered sandwich covariance used by OLS, logit, and probit.
+    Country-clustered sandwich covariance used by OLS, LPM, logit, and probit.
     `bread` is the inverse information matrix appropriate to the estimator;
     `score_obs` contains one score vector per observation. Scores are summed
     within country before forming the sandwich meat. The finite-sample factor
@@ -1261,7 +1261,7 @@ def _country_clustered_cov(bread, score_obs, cluster_labels, estimator_name):
 
 
 def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="target_year",
-                          extra_cols=None):
+                          extra_cols=None, _estimator_name="OLS"):
     """
     extra_cols: optional list of ADDITIONAL regressor column names
     already present in df (e.g. an interaction term X*shock_dummy) --
@@ -1300,7 +1300,7 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
     bread = np.linalg.pinv(X_mat.T @ X_mat)
     score_obs = X_mat * resid[:, None]
     cov, n_clusters = _country_clustered_cov(
-        bread, score_obs, d[entity_col].to_numpy(), "OLS"
+        bread, score_obs, d[entity_col].to_numpy(), _estimator_name
     )
     se_all = np.sqrt(np.abs(np.diag(cov)))
     cluster_dof = n_clusters - 1
@@ -1327,6 +1327,24 @@ def panel_ols_two_way_fe(df, y_col, x_col, entity_col="country", time_col="targe
         "n_entities": len(entities), "n_periods": len(periods),
         "n_clusters": n_clusters,
     }
+
+
+def panel_lpm_two_way_fe(df, y_col, x_col, entity_col="country",
+                         time_col="target_year", extra_cols=None):
+    """Two-way fixed-effects linear probability model estimated by OLS.
+
+    The dependent variable is 1 when ``y_col`` is strictly positive and 0
+    otherwise. Missing values remain missing and are excluded. Country and
+    time fixed effects, the country-clustered finite-sample correction, and
+    cluster-t inference are identical to the continuous-outcome OLS models.
+    """
+    binary_col = "__positive_growth_surprise"
+    d = df.copy()
+    d[binary_col] = np.where(
+        d[y_col].isna(), np.nan, (d[y_col] > 0).astype(float))
+    return panel_ols_two_way_fe(
+        d, binary_col, x_col, entity_col=entity_col, time_col=time_col,
+        extra_cols=extra_cols, _estimator_name="LPM")
 
 
 def panel_logit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="target_year",
@@ -1610,6 +1628,287 @@ def panel_probit_two_way_fe(df, y_col, x_col, entity_col="country", time_col="ta
     }
 
 
+def panel_cre_probit(df, y_col, x_col, entity_col="country",
+                     time_col="target_year", extra_cols=None,
+                     quadrature_points=20):
+    """Mundlak correlated-random-effects probit with a country intercept.
+
+    Every substantive time-varying regressor in ``[x_col] + extra_cols`` is
+    decomposed into its within-country deviation and country mean. The
+    coefficient returned as ``beta`` is therefore beta_w. Coefficients in
+    ``extra`` are likewise within coefficients, including gamma_w for an
+    interaction term. ``between`` contains beta_B/gamma_B and the between
+    coefficients of the controls. Forecast-type indicators and time fixed
+    effects enter directly; they are design/time controls rather than the
+    country-level exposures whose correlation with the random intercept is
+    handled by the Mundlak means.
+
+    The country random intercept is integrated out by Gauss-Hermite
+    quadrature. Standard errors use a country-clustered sandwich based on the
+    integrated country likelihood scores, with the same finite-sample factor
+    as the other estimators in this script. This robust covariance affects
+    inference only; the Mundlak terms are what relax the conventional random-
+    effects independence assumption.
+    """
+    from numpy.polynomial.hermite import hermgauss
+    from scipy.optimize import minimize
+    from scipy.special import logsumexp
+
+    extra_cols = extra_cols or []
+    varying_cols = list(dict.fromkeys([x_col] + extra_cols))
+    needed_cols = list(dict.fromkeys(
+        [y_col, entity_col, time_col]
+        + varying_cols + FORECAST_TYPE_CONTROL_COLS))
+    d = df[needed_cols].dropna().copy().reset_index(drop=True)
+    n_obs = len(d)
+    entities = sorted(d[entity_col].unique())
+    periods = sorted(d[time_col].unique())
+    n_clusters = len(entities)
+    if n_clusters < 2:
+        raise ValueError(
+            "Correlated-random-effects probit requires at least two countries.")
+
+    y_arr = (d[y_col] > 0).astype(float).to_numpy()
+    if np.unique(y_arr).size < 2:
+        raise ValueError(
+            "Correlated-random-effects probit requires both positive and "
+            "non-positive growth-surprise observations.")
+
+    # Explicit within-between (Mundlak) decomposition. Keeping the original
+    # variable name for the deviation makes all existing result-writing code
+    # read beta_w/gamma_w from the same keys it used previously.
+    design_parts = [pd.Series(1.0, index=d.index, name="const")]
+    between_names = {}
+    for col in varying_cols:
+        country_mean = d.groupby(entity_col)[col].transform("mean")
+        within = (d[col] - country_mean).rename(col)
+        if float(within.std(ddof=0)) < 1e-12:
+            raise ValueError(
+                f"CRE probit: '{col}' has no within-country variation in "
+                "the complete-case estimation sample.")
+        design_parts.append(within.astype(float))
+
+        between_name = f"{col}__between"
+        # A constant country mean is collinear with the intercept. This can
+        # occur for design variables in a perfectly balanced panel; omit it
+        # explicitly instead of relying on a pseudo-inverse silently.
+        if float(country_mean.std(ddof=0)) >= 1e-12:
+            design_parts.append(country_mean.rename(between_name).astype(float))
+            between_names[col] = between_name
+        else:
+            between_names[col] = None
+
+    if FORECAST_TYPE_CONTROL_COLS:
+        design_parts.append(d[FORECAST_TYPE_CONTROL_COLS].astype(float))
+    time_dummies = pd.get_dummies(
+        d[time_col], prefix="t", drop_first=True, dtype=float)
+    design_parts.append(time_dummies)
+    X = pd.concat(design_parts, axis=1)
+    X_mat = X.to_numpy(dtype=float)
+    n_fixed = X_mat.shape[1]
+    n_parameters = n_fixed + 1  # fixed coefficients plus log(sigma_country)
+    if n_obs <= n_parameters:
+        raise ValueError(
+            "CRE probit requires more observations than estimated parameters.")
+
+    rank = np.linalg.matrix_rank(X_mat)
+    if rank < n_fixed:
+        print(f"    [!] WARNING (CRE probit): design rank is {rank} but "
+              f"contains {n_fixed} columns; coefficients may be weakly "
+              "identified because of collinearity.")
+
+    cluster_positions = [
+        np.flatnonzero(d[entity_col].to_numpy() == entity)
+        for entity in entities
+    ]
+    gh_nodes, gh_weights = hermgauss(quadrature_points)
+    log_gh_weights = np.log(gh_weights) - 0.5 * np.log(np.pi)
+    sqrt_two = np.sqrt(2.0)
+    eps = 1e-12
+
+    def _loglike_gradient(theta, return_cluster_scores=False):
+        beta = theta[:n_fixed]
+        sigma_country = np.exp(theta[-1])
+        total_loglike = 0.0
+        cluster_scores = []
+
+        for positions in cluster_positions:
+            Xi = X_mat[positions]
+            yi = y_arr[positions]
+            eta = (
+                Xi @ beta
+            )[:, None] + sqrt_two * sigma_country * gh_nodes[None, :]
+            cdf = np.clip(_stats.norm.cdf(eta), eps, 1.0 - eps)
+            pdf = _stats.norm.pdf(eta)
+            conditional_ll = (
+                yi[:, None] * np.log(cdf)
+                + (1.0 - yi[:, None]) * np.log(1.0 - cdf)
+            ).sum(axis=0)
+            log_terms = log_gh_weights + conditional_ll
+            country_ll = logsumexp(log_terms)
+            posterior_weights = np.exp(log_terms - country_ll)
+
+            score_eta = pdf * (
+                yi[:, None] / cdf
+                - (1.0 - yi[:, None]) / (1.0 - cdf))
+            score_beta_by_node = Xi.T @ score_eta
+            score_log_sigma_by_node = (
+                score_eta
+                * (sqrt_two * sigma_country * gh_nodes[None, :])
+            ).sum(axis=0)
+            score_by_node = np.vstack([
+                score_beta_by_node, score_log_sigma_by_node[None, :]
+            ])
+            country_score = score_by_node @ posterior_weights
+            total_loglike += country_ll
+            cluster_scores.append(country_score)
+
+        cluster_scores = np.vstack(cluster_scores)
+        total_score = cluster_scores.sum(axis=0)
+        if return_cluster_scores:
+            return total_loglike, total_score, cluster_scores
+        return total_loglike, total_score
+
+    # Starting probability sets the intercept; a moderate initial country SD
+    # avoids beginning exactly on the zero-variance boundary.
+    theta0 = np.zeros(n_parameters)
+    theta0[0] = _stats.norm.ppf(np.clip(y_arr.mean(), 0.02, 0.98))
+    theta0[-1] = np.log(0.5)
+
+    def _objective(theta):
+        ll, score = _loglike_gradient(theta)
+        return -ll, -score
+
+    bounds = [(None, None)] * n_fixed + [(np.log(1e-4), np.log(20.0))]
+    opt_result = minimize(
+        _objective, theta0, jac=True, method="L-BFGS-B", bounds=bounds,
+        options={"maxiter": 2000, "ftol": 1e-11, "gtol": 1e-7})
+    if not opt_result.success:
+        print(f"    [!] WARNING (CRE probit): optimizer did not report "
+              f"success ({opt_result.message}); results may be unstable.")
+
+    theta_hat = opt_result.x
+    ll_full, _, cluster_scores = _loglike_gradient(
+        theta_hat, return_cluster_scores=True)
+
+    # Numerical observed-information matrix from the analytic score. This is
+    # more reliable for the sandwich bread than the limited-memory optimizer's
+    # internal Hessian approximation.
+    observed_info = np.empty((n_parameters, n_parameters))
+    for j in range(n_parameters):
+        step = 1e-5 * (1.0 + abs(theta_hat[j]))
+        plus = theta_hat.copy()
+        minus = theta_hat.copy()
+        plus[j] += step
+        minus[j] -= step
+        _, grad_plus = _objective(plus)
+        _, grad_minus = _objective(minus)
+        observed_info[:, j] = (grad_plus - grad_minus) / (2.0 * step)
+    observed_info = 0.5 * (observed_info + observed_info.T)
+    bread = np.linalg.pinv(observed_info)
+    meat = cluster_scores.T @ cluster_scores
+    correction = (
+        (n_clusters / (n_clusters - 1))
+        * ((n_obs - 1) / (n_obs - n_parameters)))
+    covariance = correction * (bread @ meat @ bread)
+    se_all = np.sqrt(np.abs(np.diag(covariance)))
+
+    def _average_marginal_effect_stats(col_name):
+        """Population-averaged marginal effect with delta-method inference.
+
+        Integrating a normal country random intercept out of a probit gives
+        Phi(X*b / sqrt(1 + sigma_country**2)). The derivative with respect to
+        design column j is therefore
+
+            phi(X*b / scale) * b_j / scale,
+
+        averaged over the model's complete-case estimation sample. For an
+        interaction column this is the average partial effect with respect to
+        that reported interaction regressor. Its clustered standard error is
+        obtained by applying the numerical delta method to the same robust
+        covariance matrix used for the CRE-probit coefficients.
+        """
+        idx = list(X.columns).index(col_name)
+
+        def _ame_at(theta):
+            beta = theta[:n_fixed]
+            sigma = np.exp(theta[-1])
+            scale = np.sqrt(1.0 + sigma ** 2)
+            marginal_index = (X_mat @ beta) / scale
+            return float(
+                np.mean(_stats.norm.pdf(marginal_index))
+                * beta[idx] / scale)
+
+        ame = _ame_at(theta_hat)
+        gradient = np.empty(n_parameters)
+        for j in range(n_parameters):
+            step = 1e-5 * (1.0 + abs(theta_hat[j]))
+            plus = theta_hat.copy()
+            minus = theta_hat.copy()
+            plus[j] += step
+            minus[j] -= step
+            gradient[j] = (_ame_at(plus) - _ame_at(minus)) / (2.0 * step)
+        variance = float(gradient @ covariance @ gradient)
+        standard_error = np.sqrt(max(variance, 0.0))
+        z_stat = ame / standard_error if standard_error > 0 else np.nan
+        p_value = (
+            2.0 * (1.0 - _stats.norm.cdf(abs(z_stat)))
+            if np.isfinite(z_stat) else np.nan)
+        return {
+            "effect": ame, "se": standard_error,
+            "z_stat": z_stat, "p_value": p_value,
+        }
+
+    def _coef_stats(col_name):
+        idx = list(X.columns).index(col_name)
+        coefficient = theta_hat[idx]
+        standard_error = se_all[idx]
+        z_stat = (
+            coefficient / standard_error if standard_error > 0 else np.nan)
+        p_value = (
+            2.0 * (1.0 - _stats.norm.cdf(abs(z_stat)))
+            if np.isfinite(z_stat) else np.nan)
+        return {
+            "beta": coefficient, "se": standard_error,
+            "z_stat": z_stat, "p_value": p_value,
+            "ame": _average_marginal_effect_stats(col_name),
+        }
+
+    main = _coef_stats(x_col)
+    extra = {col: _coef_stats(col) for col in extra_cols}
+    between = {
+        col: (_coef_stats(name) if name is not None else {
+            "beta": np.nan, "se": np.nan,
+            "z_stat": np.nan, "p_value": np.nan,
+        })
+        for col, name in between_names.items()
+    }
+
+    p_bar = np.clip(y_arr.mean(), eps, 1.0 - eps)
+    ll_null = (
+        y_arr * np.log(p_bar) + (1.0 - y_arr) * np.log(1.0 - p_bar)
+    ).sum()
+    pseudo_r2 = 1.0 - ll_full / ll_null if ll_null != 0 else np.nan
+    sigma_country = float(np.exp(theta_hat[-1]))
+
+    return {
+        **main,
+        "extra": extra,
+        "between": between,
+        "random_effect_sd": sigma_country,
+        "pseudo_r2": pseudo_r2,
+        "log_likelihood": ll_full,
+        "n_obs": n_obs,
+        "n_entities": n_clusters,
+        "n_periods": len(periods),
+        "n_clusters": n_clusters,
+        "quadrature_points": quadrature_points,
+        "converged": bool(opt_result.success),
+    }
+
+
+
+
 def _standardize(series):
     """
     Z-score standardization (x - mean) / sd, per explicit instruction
@@ -1755,10 +2054,11 @@ def _academic_stars(p_value):
     return ""
 
 
-# var_label -> {model_number: (coef_value, p_value)} -- filled in as
-# each of the six regression tables below is built, then read out at
-# the very end to build the academic-style summary table.
+# var_label -> {model_number: (value, p_value)} -- filled in as each of
+# the six binary-response models below is built, then read out to construct
+# the coefficient and average-marginal-effect panels of the compact table.
 summary_table_results = {}
+summary_table_ame_results = {}
 
 
 regression_specs = [
@@ -2177,7 +2477,7 @@ charts_end_row = notes_row + len(notes)
 # the PROBABILITY that growth_surprise > 0 -- is what the "share
 # positive surprises" blocks above (and their D/F/G/H significance
 # markers) test via country-clustered differences in shares, and what
-# the LOGIT regressions further below test directly via a binary outcome model.
+# the LPM, CRE-probit, and logit regressions below test directly via a binary outcome.
 # These two kinds of results can legitimately diverge (e.g. a variable
 # can shift the average size of surprises without changing how often
 # they are positive, or vice versa, if a few large outliers dominate
@@ -2188,7 +2488,7 @@ ws_summary.cell(
     value="NOTE: the regressions below use CONTINUOUS growth_surprise (both "
           "positive and negative values) -- beta/gamma estimate whether X "
           "raises the AVERAGE SIZE of the surprise, NOT whether X makes a "
-          "positive surprise more LIKELY (that is what the LOGIT models "
+          "positive surprise more LIKELY (that is what the LPM, CRE-probit, and LOGIT models "
           "further below, and the 'share positive surprises' blocks above, "
           "test instead). Every X is aligned strictly at t-1 relative to the "
           "outcome year t; observations without that prior-year value are excluded. "
@@ -2244,7 +2544,6 @@ for offset, (label, df_src, x_col) in enumerate(regression_specs):
     ws_summary.cell(row=row_idx, column=next_col + 3, value=result["n_periods"])
     print(f"  Panel regression ({label}): beta={result['beta']:.4f}, "
           f"p={result['p_value']:.4f}, N={result['n_obs']}")
-    summary_table_results.setdefault(_clean_var_label(label), {})[4] = (result["beta"], result["p_value"])
 
 # Widths for B-H (shared with the "full sample"/"below"/"above" summary
 # blocks above, incl. their significance-star suffixes like "full
@@ -2337,7 +2636,6 @@ for offset, (label, df_src, x_col) in enumerate(interaction_specs):
     print(f"  Interaction regression ({label}): beta={result['beta']:.4f} "
           f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} (p={gamma['p_value']:.4f}), "
           f"N={result['n_obs']}")
-    summary_table_results.setdefault(_clean_var_label(label), {})[5] = (gamma["beta"], gamma["p_value"])
 
 # --- THIRD regression table: same interaction specification, but with
 # X replaced by a BINARY "above median" indicator (1 if that
@@ -2455,33 +2753,27 @@ for offset, (label, df_src, x_col) in enumerate(above_median_specs):
     print(f"  Above-median interaction regression ({label}): beta={result['beta']:.4f} "
           f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} (p={gamma['p_value']:.4f}), "
           f"N={result['n_obs']}, median={median_val:.4f}")
-    summary_table_results.setdefault(_clean_var_label(label), {})[6] = (gamma["beta"], gamma["p_value"])
 
 
-# --- LOGIT versions of all three specifications above (plain X, X +
-# shock-year interaction, above-median value + interaction), estimating
-# P(growth_surprise > 0 | X) instead of E[growth_surprise | X] -- see
-# panel_logit_two_way_fe()'s own docstring for the full explanation of
-# why logit (not probit) was chosen here, and the important caveat that
-# this specific LSDV-style (dummy-variable) implementation does NOT
-# fully solve the incidental parameters problem the way a genuine
-# conditional (fixed-effects) logit would.
+# --- Correlated-random-effects (Mundlak) PROBIT versions of all three
+# specifications. Country means absorb correlation between persistent
+# country heterogeneity and the time-varying exposures/controls; a country
+# random intercept is integrated out by Gauss-Hermite quadrature. The
+# coefficients of interest are beta_w and, where present, gamma_w.
 probit_primary_start_row = reg3_header_row + len(above_median_specs) + 3
 ws_summary.cell(
     row=probit_primary_start_row, column=1,
-    value="PROBIT versions of the three panel regressions above: "
-          "P(growth_surprise > 0) = Phi(const + country FE + time FE + beta*X "
-          "[+ gamma*interaction]" + CONTROL_EQUATION_TERM
-          + FORECAST_TYPE_EQUATION_TERM + ")"
+    value="CORRELATED RANDOM-EFFECTS PROBIT (Mundlak): "
+          "P(growth_surprise > 0), with country random intercept, time FE, "
+          "within-country X and interaction terms, and their country means"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=probit_primary_start_row + 1, column=1,
-    value="(estimates whether X makes a POSITIVE surprise MORE LIKELY, not whether "
-          "X raises the average SIZE of the surprise -- see the note above the OLS "
-          "tables. PRIMARY functional form for this project (rather than logit) -- "
-          "probit is the more common choice in the macro/growth-forecasting "
-          "literature and aligns conceptually with OLS's implicit normal-error "
-          "assumption; a logit robustness check is reported further below)"
+    value="(beta_w is the within-country exposure coefficient; gamma_w is the "
+          "additional within-country slope in shock years. Country means of X, "
+          "interactions, and enabled controls implement the Mundlak correction, "
+          "relaxing the conventional random-effects assumption that the country "
+          "effect is uncorrelated with those regressors.)"
 ).font = Font(italic=True, size=9)
 
 probit_primary_spec_groups = [
@@ -2497,13 +2789,21 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
     probit_primary_header_row = probit_primary_current_row + 1
     if interaction_col_name is None:
         probit_primary_headers = (
-            ["Explanatory variable", "beta (X)", "SE(beta)", "z(beta)", "p(beta)"]
-            + CONTROL_HEADERS + ["Pseudo R-sq", "N (obs)"])
+            ["Explanatory variable", "beta_w (within X)", "SE(beta_w)",
+             "z(beta_w)", "p(beta_w)", "beta_B (country mean X)",
+             "SE(beta_B)", "p(beta_B)"]
+            + CONTROL_HEADERS
+            + ["Pseudo R-sq", "N (obs)", "SD(country random effect)"])
     else:
         probit_primary_headers = (
-            ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
-             f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)"]
-            + CONTROL_HEADERS + ["Pseudo R-sq", "N (obs)"])
+            ["Explanatory variable", "beta_w (within X)", "SE(beta_w)",
+             "p(beta_w)", f"gamma_w ({interaction_col_name})",
+             "SE(gamma_w)", "p(gamma_w)", "beta_B (country mean X)",
+             "SE(beta_B)", "p(beta_B)",
+             f"gamma_B (country mean {interaction_col_name})",
+             "SE(gamma_B)", "p(gamma_B)"]
+            + CONTROL_HEADERS
+            + ["Pseudo R-sq", "N (obs)", "SD(country random effect)"])
     for col_idx, h in enumerate(probit_primary_headers, start=1):
         ws_summary.cell(row=probit_primary_header_row, column=col_idx, value=h).font = bold
 
@@ -2518,7 +2818,7 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src[x_col_std] = _standardize(df_src[x_col])
             control_cols = _prepare_regression_controls(
                 df_src, ["growth_surprise", x_col_std])
-            result = panel_probit_two_way_fe(
+            result = panel_cre_probit(
                 df_src, "growth_surprise", x_col_std,
                 extra_cols=control_cols)
             ws_summary.cell(row=row_idx, column=1, value=label)
@@ -2526,13 +2826,25 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
             ws_summary.cell(row=row_idx, column=4, value=round(result["z_stat"], 3))
             ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
-            next_col = _write_control_results(ws_summary, row_idx, 6, result)
+            beta_between = result["between"][x_col_std]
+            ws_summary.cell(row=row_idx, column=6,
+                            value=round(beta_between["beta"], 4))
+            ws_summary.cell(row=row_idx, column=7,
+                            value=round(beta_between["se"], 4))
+            ws_summary.cell(row=row_idx, column=8,
+                            value=round(beta_between["p_value"], 4))
+            next_col = _write_control_results(ws_summary, row_idx, 9, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
-            print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
+            ws_summary.cell(row=row_idx, column=next_col + 2,
+                            value=round(result["random_effect_sd"], 4))
+            print(f"  CRE probit ({group_label}, {label}): beta_w={result['beta']:.4f} "
                   f"(p={result['p_value']:.4f}), N={result['n_obs']}")
-            summary_table_results.setdefault(_clean_var_label(label), {})[1] = (
+            summary_table_results.setdefault(_clean_var_label(label), {})[4] = (
                 result["beta"], result["p_value"])
+            summary_table_ame_results.setdefault(
+                _clean_var_label(label), {})[4] = (
+                    result["ame"]["effect"], result["ame"]["p_value"])
         elif interaction_col_name == "interaction":
             x_col_std = x_col + "_std"
             df_src[x_col_std] = _standardize(df_src[x_col])
@@ -2540,7 +2852,7 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src["interaction"] = df_src[x_col_std] * df_src["shock_year_dummy"]
             control_cols = _prepare_regression_controls(
                 df_src, ["growth_surprise", x_col_std, "interaction"])
-            result = panel_probit_two_way_fe(
+            result = panel_cre_probit(
                 df_src, "growth_surprise", x_col_std,
                 extra_cols=["interaction"] + control_cols)
             gamma = result["extra"]["interaction"]
@@ -2551,14 +2863,33 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            next_col = _write_control_results(ws_summary, row_idx, 8, result)
+            beta_between = result["between"][x_col_std]
+            gamma_between = result["between"]["interaction"]
+            ws_summary.cell(row=row_idx, column=8,
+                            value=round(beta_between["beta"], 4))
+            ws_summary.cell(row=row_idx, column=9,
+                            value=round(beta_between["se"], 4))
+            ws_summary.cell(row=row_idx, column=10,
+                            value=round(beta_between["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=11,
+                            value=round(gamma_between["beta"], 4))
+            ws_summary.cell(row=row_idx, column=12,
+                            value=round(gamma_between["se"], 4))
+            ws_summary.cell(row=row_idx, column=13,
+                            value=round(gamma_between["p_value"], 4))
+            next_col = _write_control_results(ws_summary, row_idx, 14, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
-            print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
-                  f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
+            ws_summary.cell(row=row_idx, column=next_col + 2,
+                            value=round(result["random_effect_sd"], 4))
+            print(f"  CRE probit ({group_label}, {label}): beta_w={result['beta']:.4f} "
+                  f"(p={result['p_value']:.4f}), gamma_w={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}")
-            summary_table_results.setdefault(_clean_var_label(label), {})[2] = (
+            summary_table_results.setdefault(_clean_var_label(label), {})[5] = (
                 gamma["beta"], gamma["p_value"])
+            summary_table_ame_results.setdefault(
+                _clean_var_label(label), {})[5] = (
+                    gamma["ame"]["effect"], gamma["ame"]["p_value"])
         else:  # above_x_shock
             median_val = df_src[x_col].dropna().median()
             # CONTINUOUS version, matching the OLS specification (model
@@ -2573,7 +2904,7 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             df_src["above_x_shock"] = df_src["above_median"] * df_src["shock_year_dummy"]
             control_cols = _prepare_regression_controls(
                 df_src, ["growth_surprise", "above_median", "above_x_shock"])
-            result = panel_probit_two_way_fe(
+            result = panel_cre_probit(
                 df_src, "growth_surprise", "above_median",
                 extra_cols=["above_x_shock"] + control_cols)
             gamma = result["extra"]["above_x_shock"]
@@ -2584,22 +2915,120 @@ for group_label, specs, interaction_col_name in probit_primary_spec_groups:
             ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
             ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
             ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
-            next_col = _write_control_results(ws_summary, row_idx, 8, result)
+            beta_between = result["between"]["above_median"]
+            gamma_between = result["between"]["above_x_shock"]
+            ws_summary.cell(row=row_idx, column=8,
+                            value=round(beta_between["beta"], 4))
+            ws_summary.cell(row=row_idx, column=9,
+                            value=round(beta_between["se"], 4))
+            ws_summary.cell(row=row_idx, column=10,
+                            value=round(beta_between["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=11,
+                            value=round(gamma_between["beta"], 4))
+            ws_summary.cell(row=row_idx, column=12,
+                            value=round(gamma_between["se"], 4))
+            ws_summary.cell(row=row_idx, column=13,
+                            value=round(gamma_between["p_value"], 4))
+            next_col = _write_control_results(ws_summary, row_idx, 14, result)
             ws_summary.cell(row=row_idx, column=next_col, value=round(result["pseudo_r2"], 4))
             ws_summary.cell(row=row_idx, column=next_col + 1, value=result["n_obs"])
-            print(f"  Probit ({group_label}, {label}): beta={result['beta']:.4f} "
-                  f"(p={result['p_value']:.4f}), gamma={gamma['beta']:.4f} "
+            ws_summary.cell(row=row_idx, column=next_col + 2,
+                            value=round(result["random_effect_sd"], 4))
+            print(f"  CRE probit ({group_label}, {label}): beta_w={result['beta']:.4f} "
+                  f"(p={result['p_value']:.4f}), gamma_w={gamma['beta']:.4f} "
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}, median={median_val:.4f}")
-            summary_table_results.setdefault(_clean_var_label(label), {})[3] = (
+            summary_table_results.setdefault(_clean_var_label(label), {})[6] = (
                 gamma["beta"], gamma["p_value"])
+            summary_table_ame_results.setdefault(
+                _clean_var_label(label), {})[6] = (
+                    gamma["ame"]["effect"], gamma["ame"]["p_value"])
 
     probit_primary_current_row = probit_primary_header_row + len(specs) + 3
 
+# Estimate the LPM specifications once here so their coefficients are
+# available to the compact table below. The cached results are written as
+# detailed tables after the logit output near the bottom of the sheet.
+lpm_spec_groups = [
+    ("Plain X", regression_specs, None),
+    ("X + shock-year interaction", interaction_specs, "interaction"),
+    ("Above-median value + interaction", above_median_specs, "above_x_shock"),
+]
+lpm_cached_results = []
+
+for group_label, specs, interaction_col_name in lpm_spec_groups:
+    for label, df_src, x_col in specs:
+        df_model = df_src.copy()
+        df_model["growth_surprise"] = (
+            df_model["realized_growth_annual_pct"]
+            - df_model["forecast_growth_annual_pct"])
+        median_val = None
+
+        if interaction_col_name is None:
+            focal_col = x_col + "_std"
+            df_model[focal_col] = _standardize(df_model[x_col])
+            control_cols = _prepare_regression_controls(
+                df_model, ["growth_surprise", focal_col])
+            extra_model_cols = control_cols
+            summary_model_number = 1
+            summary_stat_col = focal_col
+        elif interaction_col_name == "interaction":
+            focal_col = x_col + "_std"
+            df_model[focal_col] = _standardize(df_model[x_col])
+            df_model["shock_year_dummy"] = df_model["target_year"].isin(
+                SHOCK_YEARS_SET).astype(float)
+            df_model["interaction"] = (
+                df_model[focal_col] * df_model["shock_year_dummy"])
+            control_cols = _prepare_regression_controls(
+                df_model, ["growth_surprise", focal_col, "interaction"])
+            extra_model_cols = ["interaction"] + control_cols
+            summary_model_number = 2
+            summary_stat_col = "interaction"
+        else:
+            median_val = df_model[x_col].dropna().median()
+            df_model["above_median_raw"] = np.where(
+                df_model[x_col].isna(), np.nan,
+                np.where(df_model[x_col] > median_val,
+                         df_model[x_col], 0.0))
+            df_model["above_median"] = _standardize(
+                df_model["above_median_raw"])
+            df_model["shock_year_dummy"] = df_model["target_year"].isin(
+                SHOCK_YEARS_SET).astype(float)
+            df_model["above_x_shock"] = (
+                df_model["above_median"] * df_model["shock_year_dummy"])
+            focal_col = "above_median"
+            control_cols = _prepare_regression_controls(
+                df_model,
+                ["growth_surprise", "above_median", "above_x_shock"])
+            extra_model_cols = ["above_x_shock"] + control_cols
+            summary_model_number = 3
+            summary_stat_col = "above_x_shock"
+
+        result = panel_lpm_two_way_fe(
+            df_model, "growth_surprise", focal_col,
+            extra_cols=extra_model_cols)
+        selected_stats = (
+            result if summary_stat_col == focal_col
+            else result["extra"][summary_stat_col])
+        summary_table_results.setdefault(
+            _clean_var_label(label), {})[summary_model_number] = (
+                selected_stats["beta"], selected_stats["p_value"])
+        # In a linear probability model, the average marginal effect of a
+        # regressor is exactly its estimated coefficient.
+        summary_table_ame_results.setdefault(
+            _clean_var_label(label), {})[summary_model_number] = (
+                selected_stats["beta"], selected_stats["p_value"])
+        lpm_cached_results.append({
+            "group_label": group_label,
+            "interaction_col_name": interaction_col_name,
+            "label": label,
+            "result": result,
+            "median_val": median_val,
+        })
+
 # --- Academic-style summary table, below ALL regression output above:
-# rows = the 4 explanatory variables, columns = the 6 models (1)-(6),
-# cells = the requested coefficient (beta for models 1 & 4, gamma for
-# models 2/3/5/6) with significance stars -- collected in
-# summary_table_results as each of the six regression loops ran above.
+# rows = the 4 explanatory variables. Columns B:G show the six requested
+# coefficients and columns H:M show the corresponding average marginal
+# effects. Models (1)-(3) are LPM; models (4)-(6) are CRE probit.
 # Layout matches the reviewed reference workbook exactly: model-number
 # row centred, a second "beta"/"gamma" sub-header row (italic, centred)
 # identifying which coefficient each column shows, one blank row before
@@ -2608,10 +3037,16 @@ model_labels = {
     1: "(1)", 2: "(2)", 3: "(3)", 4: "(4)", 5: "(5)", 6: "(6)",
 }
 model_estimator = {
-    1: "Probit", 2: "Probit", 3: "Probit", 4: "OLS", 5: "OLS", 6: "OLS",
+    1: "LPM", 2: "LPM", 3: "LPM",
+    4: "CRE Probit", 5: "CRE Probit", 6: "CRE Probit",
 }
 model_coef_kind = {
-    1: "beta", 2: "gamma", 3: "gamma", 4: "beta", 5: "gamma", 6: "gamma",
+    1: "beta", 2: "gamma", 3: "gamma",
+    4: "beta_w", 5: "gamma_w", 6: "gamma_w",
+}
+model_ame_kind = {
+    1: "AME(beta)", 2: "AME(gamma)", 3: "AME(gamma)",
+    4: "AME(beta_w)", 5: "AME(gamma_w)", 6: "AME(gamma_w)",
 }
 center_align = Alignment(horizontal="center")
 from openpyxl.styles import Side, Border
@@ -2624,6 +3059,22 @@ ws_summary.cell(row=summary_table_start_row, column=1,
                  value="Regression results").font = Font(
     bold=True, size=12)
 
+panel_title_row = summary_table_start_row + 1
+ws_summary.merge_cells(
+    start_row=panel_title_row, start_column=2,
+    end_row=panel_title_row, end_column=7)
+coef_panel_title = ws_summary.cell(
+    row=panel_title_row, column=2, value="Estimated coefficients")
+coef_panel_title.font = bold
+coef_panel_title.alignment = center_align
+ws_summary.merge_cells(
+    start_row=panel_title_row, start_column=8,
+    end_row=panel_title_row, end_column=13)
+ame_panel_title = ws_summary.cell(
+    row=panel_title_row, column=8, value="Average marginal effects")
+ame_panel_title.font = bold
+ame_panel_title.alignment = center_align
+
 table_header_row = summary_table_start_row + 2
 ws_summary.cell(row=table_header_row, column=1, value="").font = bold
 for model_num in range(1, 7):
@@ -2631,8 +3082,13 @@ for model_num in range(1, 7):
                             value=model_labels[model_num])
     cell.font = bold
     cell.alignment = center_align
+    ame_cell = ws_summary.cell(
+        row=table_header_row, column=7 + model_num,
+        value=model_labels[model_num])
+    ame_cell.font = bold
+    ame_cell.alignment = center_align
 
-# NEW row identifying each column's estimator (OLS vs. Logit), between
+# Row identifying each column's estimator (LPM vs. CRE probit), between
 # the model-number row and the beta/gamma row.
 estimator_row = table_header_row + 1
 for model_num in range(1, 7):
@@ -2640,6 +3096,11 @@ for model_num in range(1, 7):
                             value=model_estimator[model_num])
     cell.font = bold
     cell.alignment = center_align
+    ame_cell = ws_summary.cell(
+        row=estimator_row, column=7 + model_num,
+        value=model_estimator[model_num])
+    ame_cell.font = bold
+    ame_cell.alignment = center_align
 
 subheader_row = estimator_row + 2
 for model_num in range(1, 7):
@@ -2648,6 +3109,12 @@ for model_num in range(1, 7):
     cell.font = Font(italic=True, size=11)
     cell.alignment = center_align
     cell.border = bottom_border
+    ame_cell = ws_summary.cell(
+        row=subheader_row, column=7 + model_num,
+        value=model_ame_kind[model_num])
+    ame_cell.font = Font(italic=True, size=11)
+    ame_cell.alignment = center_align
+    ame_cell.border = bottom_border
 ws_summary.cell(row=subheader_row, column=1).border = bottom_border
 
 # Row order and display names, per explicit instruction, matching the
@@ -2669,6 +3136,7 @@ for row_offset, (internal_label, display_label) in enumerate(table_display_names
     if is_last_row:
         label_cell.border = bottom_border
     coefs_for_var = summary_table_results.get(internal_label, {})
+    ames_for_var = summary_table_ame_results.get(internal_label, {})
     for model_num in range(1, 7):
         coef_p = coefs_for_var.get(model_num)
         cell = ws_summary.cell(row=row_idx, column=1 + model_num)
@@ -2677,50 +3145,71 @@ for row_offset, (internal_label, display_label) in enumerate(table_display_names
             cell.border = bottom_border
         if coef_p is None:
             cell.value = "n/a"
-            continue
-        coef_val, p_val = coef_p
-        stars = _academic_stars(p_val)
-        # 2 decimals (was 4), per explicit instruction, matching the
-        # reviewed reference workbook.
-        cell.value = f"{coef_val:.2f}{stars}"
+        else:
+            coef_val, p_val = coef_p
+            stars = _academic_stars(p_val)
+            # 2 decimals (was 4), per explicit instruction, matching the
+            # reviewed reference workbook.
+            cell.value = f"{coef_val:.2f}{stars}"
+
+        ame_p = ames_for_var.get(model_num)
+        ame_cell = ws_summary.cell(
+            row=row_idx, column=7 + model_num)
+        ame_cell.alignment = center_align
+        if is_last_row:
+            ame_cell.border = bottom_border
+        if ame_p is None:
+            ame_cell.value = "n/a"
+        else:
+            ame_val, ame_p_value = ame_p
+            ame_stars = _academic_stars(ame_p_value)
+            ame_cell.value = f"{ame_val:.2f}{ame_stars}"
 
 table_note_row = data_first_row + len(table_display_names) + 1
 note_lines = [
-    "Note: Coefficient shown is beta for models (1) and (4) (the plain-X "
-    "specification), and gamma (the interaction-term coefficient) for models "
-    "(2), (3), (5), and (6). Significance: * p<0.10, ** p<0.05, *** p<0.01.",
-    "(4) OLS, plain X: growth_surprise = const + country FE + time FE + beta*X"
+    "Note: Models (1)-(3) are LPM and models (4)-(6) are CRE probit. Columns B-G "
+    "report coefficients; columns H-M report the corresponding average marginal "
+    "effects (AMEs). Significance: * p<0.10, ** p<0.05, *** p<0.01.",
+    "(1) LPM, plain X: 1(growth_surprise > 0) = const + country FE + time FE + beta*X"
     + CONTROL_EQUATION_TERM + FORECAST_TYPE_EQUATION_TERM + ".",
-    "(5) OLS, X + shock-year interaction: adds gamma*(X*shock_year_dummy) to (4); "
+    "(2) LPM, X + shock-year interaction: adds gamma*(X*shock_year_dummy) to (1); "
     "gamma is the ADDITIONAL effect of X specifically during shock years.",
     # Split across two lines, same reasoning/layout as (1) below: this
     # note is noticeably longer than the others (266 characters as one
     # line) and was wrapping/overflowing awkwardly as a single line.
-    "(6) OLS, above-median value + interaction: same as (5), but X is replaced "
+    "(3) LPM, above-median value + interaction: same as (2), but X is replaced "
     "by a variable equal to X's own value where X is above its overall median, "
     "and 0 otherwise (NOT a binary indicator);",
     "     gamma is that above-median magnitude's additional effect during shock years.",
     # Split across two lines (matching the reviewed reference workbook's
     # own rows 154-155) -- this one note is noticeably longer than the
     # others and was wrapping/overflowing awkwardly as a single line.
-    "(1) PROBIT, plain X: same specification as (4), but P(growth_surprise > 0) "
-    "instead of E[growth_surprise] -- see the note above the OLS tables and "
-    "panel_probit_two_way_fe()'s docstring",
-    "     for the beta-vs-gamma interpretation and the incidental-parameters caveat.",
-    "(2) PROBIT, X + shock-year interaction: probit counterpart of (5).",
-    "(3) PROBIT, above-median value + interaction: probit counterpart of (6).",
-    "Standard errors in every OLS, probit, and logit regression are COUNTRY-CLUSTERED "
+    "(4) CRE PROBIT, plain X: same binary outcome and substantive regressors as LPM "
+    "model (1), but with a normal-CDF link, a country random intercept, time fixed "
+    "effects, and Mundlak country means of all time-varying regressors.",
+    "(5) CRE PROBIT, X + shock-year interaction: CRE-probit counterpart of (2).",
+    "(6) CRE PROBIT, above-median value + interaction: CRE-probit counterpart of (3).",
+    "     Models (4)-(6) report beta_w for the plain-X model and gamma_w for the "
+    "interaction models: these are the WITHIN-country coefficients. Corresponding "
+    "between-country coefficients are shown only in the detailed CRE-probit output.",
+    "AME inference: an LPM AME equals its coefficient. CRE-probit AMEs integrate over "
+    "the estimated country random-effect distribution and average the resulting partial "
+    "effects over the complete-case estimation sample.",
+    "     CRE-probit AME standard errors and p-values use the delta method with the same "
+    "country-clustered covariance matrix. For interaction models, the displayed AME is "
+    "the average partial effect of the reported within interaction regressor.",
+    "Standard errors in every OLS, LPM, CRE-probit, and logit regression are COUNTRY-CLUSTERED "
     "sandwich standard errors, equivalent to Stata's vce(cluster country_id).",
     "     This allows arbitrary heteroskedasticity and dependence among observations "
     "within the same country; inference assumes independence across countries. The "
-    "same finite-sample cluster correction is used for all three estimators.",
-    "     OLS p-values use a t distribution with number-of-countries minus one degrees "
-    "of freedom; probit and logit report their conventional cluster-robust z tests.",
+    "same finite-sample cluster correction is used for all four estimators.",
+    "     OLS and LPM p-values use a t distribution with number-of-countries minus one degrees "
+    "of freedom; CRE probit and logit report cluster-robust z tests.",
     "Timing: each focal explanatory variable X is the country's observed value in t-1 "
     "for an outcome in year t; missing t-1 values are excluded from the relevant "
     "chart, test, and regression.",
     "     AboveMedian_raw is constructed from that same t-1 explanatory value, and "
-    "shock interactions multiply the lagged exposure by the outcome-year shock dummy; "
+    "shock interactions multiply the lagged exposure by the outcome-year shock dummy. "
     + CONTROL_SETTING_NOTE + FORECAST_TYPE_SETTING_NOTE
     + " Control coefficients phi and theta are never included in the compact "
       "Regression results table.",
@@ -2728,8 +3217,8 @@ note_lines = [
     # split across several lines, same wrapping reasoning as the notes
     # above.
     "Explanatory variables are STANDARDIZED (z-score), the dependent variable is NOT: "
-    "growth_surprise (the left-hand-side variable) is left in its original, "
-    "non-standardized units in every regression above; X and AboveMedian are each",
+    "continuous growth_surprise remains in its original units in OLS, while LPM, CRE probit, "
+    "and logit use the unstandardized indicator 1(growth_surprise > 0); X and AboveMedian are each",
     "     standardized before entering the regression (mean 0, SD 1) -- but "
     "shock_year_dummy and the interaction terms themselves (X*shock_year_dummy, "
     "AboveMedian*shock_year_dummy) are NOT separately standardized, since they are",
@@ -2738,11 +3227,11 @@ note_lines = [
     "the exact complete-case sample used by that regression.",
     "     The detailed tables report phi, SE(phi), and p(phi) for State Aid and "
     "theta, SE(theta), and p(theta) for previous-year trade openness when enabled.",
-    "For OLS (models 4-6): this means beta is directly interpretable as \"a "
-    "one-standard-deviation increase in X is associated with a beta-unit change in "
-    "growth_surprise (in its own original units), holding other variables constant.\"",
-    "For PROBIT (models 1-3): the SAME one-standard-deviation-increase framing "
-    "applies to the underlying latent index (X*beta), but NOT directly to the predicted "
+    "For LPM (models 1-3): beta, or gamma for an interaction term, is the change in "
+    "the probability of a positive surprise associated with a one-unit increase in its "
+    "reported regressor; multiply the coefficient by 100 for percentage points.",
+    "For CRE PROBIT (models 4-6): beta_w and gamma_w describe WITHIN-country changes "
+    "on the underlying latent index, but NOT directly changes in the predicted "
     "PROBABILITY of a positive surprise -- because of the normal (Gaussian) link function,",
     "     you cannot get the change in probability simply by reading off beta: a "
     "one-standard-deviation increase in X is associated with an increase in the "
@@ -2750,42 +3239,37 @@ note_lines = [
     "     points, but that number is NOT beta itself, and it is NOT constant -- it "
     "depends on the STARTING VALUES of all the covariates (the marginal effect of X "
     "on probability varies along the normal CDF curve, largest near p=0.5 and",
-    "     smaller near p=0 or p=1). Computing an actual percentage-point figure would "
-    "require evaluating the model's predicted probability at a specific combination "
-    "of covariate values (e.g. at their means) both before and after a "
-    "one-standard-deviation shift in X, which is not done in this table.",
+    "     smaller near p=0 or p=1). The AME panel supplies the sample-average probability "
+    "effect after integrating over the country random effect; multiply an AME by 100 "
+    "to express it in percentage points.",
 ]
 for offset, line in enumerate(note_lines):
     cell = ws_summary.cell(row=table_note_row + offset, column=1, value=line)
     cell.font = Font(italic=True, size=9)
 
 # White background across the ENTIRE table (title row through the last
-# note line, columns A-G), matching the reviewed reference workbook --
+# note line, columns A-M), matching the reviewed reference workbook --
 # applied as a final pass over the whole range rather than per-cell
 # above, so no cell in this section is accidentally missed.
 table_last_row = table_note_row + len(note_lines) - 1
 for r in range(summary_table_start_row, table_last_row + 1):
-    for c in range(1, 8):
+    for c in range(1, 14):
         ws_summary.cell(row=r, column=c).fill = white_fill
 
-# --- PROBIT robustness check, at the very bottom of the summary
-# sheet, in the SAME table format as the OLS/logit tables above.
-# Estimates the same three specifications (plain X, X+shock-year
-# interaction, above-median value+interaction) as probit models
-# instead of logit -- see panel_probit_two_way_fe()'s own docstring
-# for why this is honestly a functional-form robustness check, not a
-# fix for the incidental-parameters problem discussed for logit above
-# (probit has no conditional-MLE escape from that problem at all).
+# --- LOGIT robustness check, below the compact regression-results table
+# in the same table format as the other detailed regression blocks.
+# It estimates analogous binary-response specifications with a logistic link
+# and country/time dummy fixed effects. It is a link-function robustness check,
+# but it does not reproduce the CRE random-intercept/Mundlak structure above.
 logit_robustness_start_row = table_last_row + 3
 ws_summary.cell(
     row=logit_robustness_start_row, column=1,
-    value="LOGIT robustness check: same three specifications as the PROBIT tables "
-          "above, re-estimated with a logistic (instead of normal) link function"
+    value="LOGIT robustness check: analogous three binary-outcome specifications, "
+          "estimated with a logistic link and country/time dummy fixed effects"
 ).font = Font(bold=True, size=12)
 ws_summary.cell(
     row=logit_robustness_start_row + 1, column=1,
-    value="(compares whether the LOGISTIC vs. NORMAL functional-form choice changes "
-          "sign/significance. LSDV-style dummy-variable logit, NOT conditional/"
+    value="(supplementary LSDV-style dummy-variable logit, NOT a CRE logit and NOT conditional/"
           "fixed-effects logit -- does not fully solve the incidental parameters "
           "problem despite logit's theoretical advantage over probit in the "
           "CONDITIONAL case; see panel_logit_two_way_fe()'s docstring)"
@@ -2891,6 +3375,87 @@ for group_label, specs, interaction_col_name in logit_robustness_spec_groups:
                   f"(p={gamma['p_value']:.4f}), N={result['n_obs']}, median={median_val:.4f}")
 
     logit_robustness_current_row = logit_robustness_header_row + len(specs) + 3
+
+# --- LPM versions of all three binary-outcome specifications, written below
+# the logit output. These use OLS with country and time dummy fixed effects.
+# Coefficients are changes in probability units; e.g. 0.05 equals 5 percentage
+# points. Inference uses country-clustered t tests with G-1 degrees of freedom.
+lpm_start_row = logit_robustness_current_row + 2
+ws_summary.cell(
+    row=lpm_start_row, column=1,
+    value="LINEAR PROBABILITY MODEL (LPM): analogous binary-outcome specifications "
+          "estimated by OLS with country and time fixed effects"
+).font = Font(bold=True, size=12)
+ws_summary.cell(
+    row=lpm_start_row + 1, column=1,
+    value="(dependent variable = 1 if growth_surprise > 0, otherwise 0; "
+          "coefficients are probability changes, so 0.05 equals 5 percentage points; "
+          "country-clustered standard errors and cluster-t p-values)"
+).font = Font(italic=True, size=9)
+
+lpm_current_row = lpm_start_row + 3
+for group_label, _, interaction_col_name in lpm_spec_groups:
+    ws_summary.cell(row=lpm_current_row, column=1, value=group_label).font = Font(
+        bold=True, size=10, italic=True)
+    lpm_header_row = lpm_current_row + 1
+    if interaction_col_name is None:
+        lpm_headers = (
+            ["Explanatory variable", "beta (X)", "SE(beta)", "t(beta)", "p(beta)"]
+            + CONTROL_HEADERS + ["R-squared", "N (obs)"])
+    else:
+        lpm_headers = (
+            ["Explanatory variable", "beta (X)", "SE(beta)", "p(beta)",
+             f"gamma ({interaction_col_name})", "SE(gamma)", "p(gamma)"]
+            + CONTROL_HEADERS + ["R-squared", "N (obs)"])
+    for col_idx, header in enumerate(lpm_headers, start=1):
+        ws_summary.cell(
+            row=lpm_header_row, column=col_idx, value=header).font = bold
+
+    group_results = [
+        cached for cached in lpm_cached_results
+        if cached["group_label"] == group_label
+    ]
+    for offset, cached in enumerate(group_results):
+        row_idx = lpm_header_row + 1 + offset
+        label = cached["label"]
+        result = cached["result"]
+        ws_summary.cell(row=row_idx, column=1, value=label)
+
+        if interaction_col_name is None:
+            ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
+            ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
+            ws_summary.cell(row=row_idx, column=4, value=round(result["t_stat"], 3))
+            ws_summary.cell(row=row_idx, column=5, value=round(result["p_value"], 4))
+            next_col = _write_control_results(ws_summary, row_idx, 6, result)
+            detail = ""
+        else:
+            gamma_col = (
+                "interaction" if interaction_col_name == "interaction"
+                else "above_x_shock")
+            gamma = result["extra"][gamma_col]
+            ws_summary.cell(row=row_idx, column=2, value=round(result["beta"], 4))
+            ws_summary.cell(row=row_idx, column=3, value=round(result["se"], 4))
+            ws_summary.cell(row=row_idx, column=4, value=round(result["p_value"], 4))
+            ws_summary.cell(row=row_idx, column=5, value=round(gamma["beta"], 4))
+            ws_summary.cell(row=row_idx, column=6, value=round(gamma["se"], 4))
+            ws_summary.cell(row=row_idx, column=7, value=round(gamma["p_value"], 4))
+            next_col = _write_control_results(ws_summary, row_idx, 8, result)
+            detail = (f", gamma={gamma['beta']:.4f} "
+                      f"(p={gamma['p_value']:.4f})")
+
+        ws_summary.cell(
+            row=row_idx, column=next_col,
+            value=round(result["r_squared"], 4))
+        ws_summary.cell(
+            row=row_idx, column=next_col + 1, value=result["n_obs"])
+        median_detail = (
+            f", median={cached['median_val']:.4f}"
+            if cached["median_val"] is not None else "")
+        print(f"  LPM ({group_label}, {label}): beta={result['beta']:.4f} "
+              f"(p={result['p_value']:.4f}){detail}, N={result['n_obs']}"
+              f"{median_detail}")
+
+    lpm_current_row = lpm_header_row + len(group_results) + 3
 
 # --- Move "data_regr" to right after "summary" in the sheet tab order,
 # per explicit instruction -- it's currently created mid-script (after
